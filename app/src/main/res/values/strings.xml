@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">Koku</string>
+    <string name="vpn_notification_channel">Koku VPN</string>
+    <string name="vpn_notification_title">Koku is running</string>
+    <string name="vpn_notification_text">Traffic is being routed through the tunnel.</string>
+</resources>
