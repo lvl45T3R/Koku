@@ -112,6 +112,11 @@ pub async fn masque_http_ping(p: &MasquePingParams, timeout: Duration) -> Result
                 key_pem: p.key_pem.clone(),
                 local_ipv4: p.local_ipv4,
                 quiet: true,
+                pin_endpoint: true,
+                expected_pins: crate::consts::MASQUE_PINS
+                    .iter()
+                    .map(|p| p.to_vec())
+                    .collect(),
             };
             AbortGuard(tokio::spawn(masque_h2::run(
                 h2cfg,
@@ -173,13 +178,16 @@ pub async fn wg_http_ping_established(
     timeout: Duration,
 ) -> Result<Duration> {
     let attempt = async {
-        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(1024);
-        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(1024);
+        let (outbound_tx, outbound_rx) =
+            tokio::sync::mpsc::channel(crate::sysprofile::channel_capacity());
+        let (inbound_tx, inbound_rx) =
+            tokio::sync::mpsc::channel(crate::sysprofile::channel_capacity());
 
         let tunnel = wireguard::WgTunnel::from_established(
             session,
             std::sync::Arc::new(p.aethernoize.clone()),
             inbound_tx,
+            p.local_ipv4,
         );
 
         let local_ipv4_str = p.local_ipv4.to_string();

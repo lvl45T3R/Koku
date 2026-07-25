@@ -15,6 +15,7 @@ mod noize;
 mod prober;
 mod quic;
 mod socks;
+mod sysprofile;
 mod tls;
 mod tunnelping;
 mod wg_prober;
@@ -38,11 +39,20 @@ const DEFAULT_CONFIG: &str = "aether.toml";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    cli::parse_and_apply()?;
+
+    let level = std::env::var("AETHER_LOG_LEVEL")
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| matches!(v.as_str(), "error" | "warn" | "info" | "debug" | "trace"))
+        .unwrap_or_else(|| "info".to_string());
+    let default_filter = format!("info,aether={level}");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
         .format_timestamp_millis()
         .init();
 
-    cli::parse_and_apply()?;
+    log::info!("Aether v{}", env!("CARGO_PKG_VERSION"));
+    sysprofile::log_summary();
 
     install_netstack_panic_guard();
 
@@ -102,10 +112,64 @@ async fn main() -> Result<()> {
                 secondary.device_id,
                 secondary.ipv4
             );
-            let peer = select_peer(&primary, Protocol::WireGuard).await?;
-            log::info!("[+] using cloudflare edge {peer} (outer)");
-            run_warp_in_warp(primary, secondary, peer, listen).await
+            run_gool(primary, secondary, listen).await
         }
+    }
+}
+
+async fn run_gool(
+    primary: account::Identity,
+    secondary: account::Identity,
+    listen: SocketAddr,
+) -> Result<()> {
+    let mut last_peer: Option<SocketAddr> = None;
+    let mut consecutive_fails: u32 = 0;
+    const MAX_CONSECUTIVE_FAILS: u32 = 2;
+
+    loop {
+        let peer = if consecutive_fails < MAX_CONSECUTIVE_FAILS {
+            if let Some(p) = last_peer {
+                Some(p)
+            } else {
+                None
+            }
+        } else {
+            if let Some(p) = last_peer {
+                log::warn!(
+                    "[-] outer endpoint {p} failed {consecutive_fails} times in a row; blacklisting and rescanning"
+                );
+            }
+            None
+        };
+
+        let peer = match peer {
+            Some(p) => p,
+            None => {
+                let p = match select_peer(&primary, Protocol::WireGuard).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::warn!(
+                            "[-] no usable outer WARP endpoint found: {e}; rescanning shortly"
+                        );
+                        tokio::time::sleep(wg_reconnect_delay()).await;
+                        continue;
+                    }
+                };
+                consecutive_fails = 0;
+                p
+            }
+        };
+
+        log::info!("[+] using cloudflare edge {peer} (outer)");
+        last_peer = Some(peer);
+
+        match run_warp_in_warp(primary.clone(), secondary.clone(), peer, listen).await {
+            Ok(()) => log::warn!("[-] gool tunnel closed; reconnecting"),
+            Err(e) => log::warn!("[-] gool tunnel ended: {e}; reconnecting"),
+        }
+        consecutive_fails += 1;
+
+        tokio::time::sleep(wg_reconnect_delay()).await;
     }
 }
 
@@ -388,6 +452,8 @@ async fn quick_verify_masque_peer(identity: &account::Identity, peer: SocketAddr
             key_pem: identity.key_pem.clone(),
             local_ipv4: parse_local_v4(&identity.ipv4),
             quiet: true,
+            pin_endpoint: true,
+            expected_pins: consts::MASQUE_PINS.iter().map(|p| p.to_vec()).collect(),
         };
         return masque_h2::verify_h2(&cfg, std::time::Duration::from_secs(5))
             .await
@@ -446,25 +512,47 @@ async fn run_masque(
         (mode_str, ip)
     };
 
+    let mut last_good_peer: Option<SocketAddr> = None;
+
     loop {
         let peer = if let Some(p) = quick_peer.take() {
             p
         } else {
-            match &forced {
-                Some(p) => match p.parse::<SocketAddr>() {
-                    Ok(peer) => {
-                        log::info!("[+] using forced peer {peer} (probe skipped)");
-                        peer
+            let retried = match last_good_peer {
+                Some(p) => {
+                    log::info!("[*] retrying last known-good gateway {p} before rescanning");
+                    if quick_verify_masque_peer(&identity, p).await {
+                        Some(p)
+                    } else {
+                        log::warn!(
+                            "[-] last known-good gateway {p} no longer responds; rescanning"
+                        );
+                        None
                     }
-                    Err(_) => return Err(AetherError::Other(format!("bad peer address {p}"))),
-                },
-                None => match hunt_masque_peer(&identity, &mode_str, ip).await {
-                    Ok(peer) => peer,
-                    Err(e) => {
-                        log::warn!("[-] no usable MASQUE gateway found: {e}; rescanning shortly");
-                        tokio::time::sleep(masque_reconnect_delay()).await;
-                        continue;
-                    }
+                }
+                None => None,
+            };
+
+            match retried {
+                Some(p) => p,
+                None => match &forced {
+                    Some(p) => match p.parse::<SocketAddr>() {
+                        Ok(peer) => {
+                            log::info!("[+] using forced peer {peer} (probe skipped)");
+                            peer
+                        }
+                        Err(_) => return Err(AetherError::Other(format!("bad peer address {p}"))),
+                    },
+                    None => match hunt_masque_peer(&identity, &mode_str, ip).await {
+                        Ok(peer) => peer,
+                        Err(e) => {
+                            log::warn!(
+                                "[-] no usable MASQUE gateway found: {e}; rescanning shortly"
+                            );
+                            tokio::time::sleep(masque_reconnect_delay()).await;
+                            continue;
+                        }
+                    },
                 },
             }
         };
@@ -475,6 +563,8 @@ async fn run_masque(
             let profile = std::env::var("AETHER_NOIZE").unwrap_or_else(|_| "firewall".to_string());
             lastconn::save(&lastconn_path, &peer.to_string(), &profile);
         }
+
+        last_good_peer = Some(peer);
 
         match run_masque_tunnel(&identity, peer, ech.clone(), listen).await {
             Ok(()) => log::warn!("[-] MASQUE tunnel closed; reconnecting"),
@@ -547,6 +637,8 @@ async fn run_masque_tunnel(
             key_pem: identity.key_pem.clone(),
             local_ipv4: parse_local_v4(&identity.ipv4),
             quiet: false,
+            pin_endpoint: true,
+            expected_pins: consts::MASQUE_PINS.iter().map(|p| p.to_vec()).collect(),
         };
         log::info!("[+] MASQUE transport: HTTP/2 (TCP) to {}", h2cfg.peer);
         tokio::spawn(masque_h2::run(
@@ -646,13 +738,50 @@ async fn hunt_wg_peer_with_profile(
     Ok(SocketAddr::new(best.ip, best.port))
 }
 
+fn wg_reconnect_delay() -> std::time::Duration {
+    let secs = std::env::var("AETHER_WG_RECONNECT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2);
+    std::time::Duration::from_secs(secs)
+}
+
+async fn hunt_wg_peer(
+    identity: &account::Identity,
+    candidates: &[(String, aethernoize::AetherNoizeConfig)],
+    mode_str: &str,
+    ip: prober::IpScan,
+) -> Result<(SocketAddr, aethernoize::AetherNoizeConfig, String)> {
+    let multi = candidates.len() > 1;
+    for (name, profile) in candidates {
+        log::info!(
+            "[*] hunting for a working WireGuard endpoint (handshake + data-plane verification, aethernoize='{name}')"
+        );
+        match hunt_wg_peer_with_profile(identity, mode_str, ip, profile.clone()).await {
+            Ok(peer) => {
+                log::info!(
+                    "[+] selected WireGuard endpoint {peer} using aethernoize profile '{name}'"
+                );
+                return Ok((peer, profile.clone(), name.clone()));
+            }
+            Err(e) => {
+                if multi {
+                    log::warn!("[-] profile '{name}' found no data-plane endpoint: {e}; trying next profile");
+                } else {
+                    log::warn!("[-] profile '{name}' found no data-plane endpoint: {e}");
+                }
+            }
+        }
+    }
+    Err(AetherError::NoCleanEndpoint)
+}
+
 async fn run_wireguard(
     identity: account::Identity,
     listen: SocketAddr,
     lastconn_path: String,
 ) -> Result<()> {
     let candidates = wg_profile_candidates();
-    let multi = candidates.len() > 1;
 
     let forced = std::env::var("AETHER_WG_PEER")
         .ok()
@@ -680,6 +809,7 @@ async fn run_wireguard(
                         ipv4,
                         &profile,
                         std::time::Duration::from_secs(6),
+                        None,
                     )
                     .await
                     {
@@ -701,82 +831,150 @@ async fn run_wireguard(
         }
     }
 
-    let selected: Option<(SocketAddr, aethernoize::AetherNoizeConfig, String)> = if let Some(q) =
-        quick
-    {
-        Some(q)
-    } else if let Some(ref p) = forced {
-        let peer: SocketAddr = p
-            .parse()
-            .map_err(|_| AetherError::Other(format!("bad peer address {p}")))?;
-        log::info!("[+] using forced peer {peer} (probe skipped)");
-
-        let mut chosen = None;
-        for (name, profile) in &candidates {
-            log::info!("[*] testing forced peer {peer} with aethernoize profile '{name}'");
-            match wireguard::verify_endpoint(
-                peer,
-                private_key,
-                peer_public,
-                identity.client_id,
-                ipv4,
-                profile,
-                std::time::Duration::from_secs(10),
-            )
-            .await
-            {
-                Ok(rtt) => {
-                    log::info!(
-                        "[+] profile '{}' passed handshake + data-plane (rtt {:?})",
-                        name,
-                        rtt
-                    );
-                    chosen = Some((peer, profile.clone(), name.clone()));
-                    break;
-                }
-                Err(e) => {
-                    log::warn!("[-] profile '{name}' failed on forced peer: {e}");
-                }
-            }
-        }
-        chosen
+    let (mode_str, ip) = if forced.is_some() || quick.is_some() {
+        (String::new(), prober::IpScan::V4)
     } else {
         let mode_str = select_scan_mode_str().await;
         let ip = select_ip_version().await;
+        (mode_str, ip)
+    };
 
-        let mut chosen = None;
-        for (name, profile) in &candidates {
-            log::info!(
-                "[*] hunting for a working WireGuard endpoint (handshake + data-plane verification, aethernoize='{name}')"
-            );
-            match hunt_wg_peer_with_profile(&identity, &mode_str, ip, profile.clone()).await {
-                Ok(peer) => {
-                    log::info!(
-                        "[+] selected WireGuard endpoint {peer} using aethernoize profile '{name}'"
+    let mut last_good: Option<(SocketAddr, aethernoize::AetherNoizeConfig, String)> = None;
+    let mut consecutive_fails_on_peer: u32 = 0;
+    const MAX_CONSECUTIVE_FAILS: u32 = 2;
+
+    loop {
+        let (peer, profile, profile_name) = if let Some(q) = quick.take() {
+            q
+        } else {
+            let retried = if consecutive_fails_on_peer >= MAX_CONSECUTIVE_FAILS {
+                if let Some((p, _, _)) = &last_good {
+                    log::warn!(
+                        "[-] endpoint {p} failed {consecutive_fails_on_peer} times in a row (likely DPI-throttled); blacklisting and rescanning"
                     );
-                    chosen = Some((peer, profile.clone(), name.clone()));
-                    break;
                 }
-                Err(e) => {
-                    if multi {
-                        log::warn!("[-] profile '{name}' found no data-plane endpoint: {e}; trying next profile");
+                None
+            } else {
+                match &last_good {
+                    Some((p, profile, _)) => {
+                        log::info!(
+                            "[*] retrying last known-good WireGuard endpoint {p} before rescanning"
+                        );
+                        match wireguard::verify_endpoint(
+                            *p,
+                            private_key,
+                            peer_public,
+                            identity.client_id,
+                            ipv4,
+                            profile,
+                            std::time::Duration::from_secs(6),
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(_) => Some(last_good.clone().unwrap()),
+                            Err(e) => {
+                                log::warn!("[-] last known-good endpoint {p} no longer responds ({e}); rescanning");
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                }
+            };
+
+            match retried {
+                Some(v) => v,
+                None => {
+                    if let Some(ref p) = forced {
+                        let peer: SocketAddr = p
+                            .parse()
+                            .map_err(|_| AetherError::Other(format!("bad peer address {p}")))?;
+                        log::info!("[+] using forced peer {peer} (probe skipped)");
+
+                        let mut chosen = None;
+                        for (name, profile) in &candidates {
+                            log::info!(
+                                "[*] testing forced peer {peer} with aethernoize profile '{name}'"
+                            );
+                            match wireguard::verify_endpoint(
+                                peer,
+                                private_key,
+                                peer_public,
+                                identity.client_id,
+                                ipv4,
+                                profile,
+                                std::time::Duration::from_secs(10),
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(rtt) => {
+                                    log::info!(
+                                        "[+] profile '{}' passed handshake + data-plane (rtt {:?})",
+                                        name,
+                                        rtt
+                                    );
+                                    chosen = Some((peer, profile.clone(), name.clone()));
+                                    break;
+                                }
+                                Err(e) => {
+                                    log::warn!("[-] profile '{name}' failed on forced peer: {e}");
+                                }
+                            }
+                        }
+                        match chosen {
+                            Some(v) => v,
+                            None => return Err(AetherError::NoCleanEndpoint),
+                        }
                     } else {
-                        log::warn!("[-] profile '{name}' found no data-plane endpoint: {e}");
+                        match hunt_wg_peer(&identity, &candidates, &mode_str, ip).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log::warn!("[-] no usable WireGuard endpoint found: {e}; rescanning shortly");
+                                tokio::time::sleep(wg_reconnect_delay()).await;
+                                continue;
+                            }
+                        }
                     }
                 }
             }
+        };
+
+        log::info!("[+] using cloudflare edge {peer}");
+
+        if forced.is_none() {
+            lastconn::save(&lastconn_path, &peer.to_string(), &profile_name);
         }
-        chosen
-    };
 
-    let (peer, profile, profile_name) = selected.ok_or(AetherError::NoCleanEndpoint)?;
-    log::info!("[+] using cloudflare edge {peer}");
+        let is_same_peer_as_before = last_good.as_ref().map(|(p, _, _)| *p) == Some(peer);
+        if !is_same_peer_as_before {
+            consecutive_fails_on_peer = 0;
+        }
+        last_good = Some((peer, profile.clone(), profile_name));
 
-    if forced.is_none() {
-        lastconn::save(&lastconn_path, &peer.to_string(), &profile_name);
+        match run_wireguard_tunnel(identity.clone(), peer, profile, listen).await {
+            Ok(()) => {
+                log::warn!("[-] WireGuard tunnel closed; reconnecting");
+                consecutive_fails_on_peer += 1;
+            }
+            Err(e) => {
+                log::warn!("[-] WireGuard tunnel ended: {e}; reconnecting");
+                consecutive_fails_on_peer += 1;
+            }
+        }
+
+        tokio::time::sleep(wg_reconnect_delay()).await;
     }
+}
 
-    run_wireguard_tunnel(identity, peer, profile, listen).await
+fn wg_tunnel_validate_timeout() -> std::time::Duration {
+    let secs = std::env::var("AETHER_WG_VALIDATE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(10);
+    std::time::Duration::from_secs(secs)
 }
 
 async fn run_wireguard_tunnel(
@@ -785,8 +983,6 @@ async fn run_wireguard_tunnel(
     aethernoize: aethernoize::AetherNoizeConfig,
     listen: SocketAddr,
 ) -> Result<()> {
-    log::info!("[*] confirming WireGuard handshake + data flow with {peer}...");
-
     let private_key = identity.private_key_bytes()?;
     let peer_public = identity.peer_public_key_bytes()?;
     let ipv4: std::net::Ipv4Addr = identity
@@ -794,50 +990,30 @@ async fn run_wireguard_tunnel(
         .parse()
         .map_err(|_| AetherError::Other("invalid ipv4".into()))?;
 
-    let test_result = wireguard::verify_endpoint(
+    log::info!("[*] validating WireGuard tunnel with {peer} (handshake + data-plane) before exposing socks5...");
+    let (_, session) = wireguard::verify_endpoint_keep_session(
         peer,
         private_key,
         peer_public,
         identity.client_id,
         ipv4,
         &aethernoize,
-        std::time::Duration::from_secs(10),
+        wg_tunnel_validate_timeout(),
+        Some(wg_keepalive_secs()),
     )
-    .await;
+    .await
+    .map_err(|e| AetherError::Other(format!("tunnel failed validation: {e}")))?;
+    log::info!("[+] wireguard tunnel validated (end-to-end data confirmed); exposing socks5");
 
-    match test_result {
-        Ok(rtt) => {
-            log::info!("[+] handshake successful (rtt {:?})", rtt);
-        }
-        Err(e) => {
-            log::error!("[-] handshake failed: {}", e);
-            return Err(AetherError::Other(format!(
-                "WireGuard handshake failed: {e}"
-            )));
-        }
-    }
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
 
-    let ipv6: std::net::Ipv6Addr = identity
-        .ipv6
-        .parse()
-        .map_err(|_| AetherError::Other("invalid ipv6".into()))?;
-
-    let cfg = wireguard::WgConfig {
-        local_private_key: private_key,
-        peer_public_key: peer_public,
-        peer_endpoint: peer,
-        local_ipv4: ipv4,
-        local_ipv6: ipv6,
-        client_id: identity.client_id,
-        preshared_key: None,
-        persistent_keepalive: Some(wg_keepalive_secs()),
-        aethernoize: std::sync::Arc::new(aethernoize),
-    };
-
-    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(1024);
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(1024);
-
-    let tunnel = wireguard::WgTunnel::new(cfg, inbound_tx).await?;
+    let tunnel = wireguard::WgTunnel::from_established(
+        session,
+        std::sync::Arc::new(aethernoize),
+        inbound_tx,
+        ipv4,
+    );
 
     let stack = netstack::spawn(
         &identity.ipv4,
@@ -877,10 +1053,6 @@ async fn establish_wg(
         .ipv4
         .parse()
         .map_err(|_| AetherError::Other("invalid ipv4".into()))?;
-    let ipv6: std::net::Ipv6Addr = identity
-        .ipv6
-        .parse()
-        .map_err(|_| AetherError::Other("invalid ipv6".into()))?;
 
     let profile = if obfuscate {
         aethernoize_config()
@@ -888,22 +1060,30 @@ async fn establish_wg(
         aethernoize::from_profile("off")
     };
 
-    let cfg = wireguard::WgConfig {
-        local_private_key: private_key,
-        peer_public_key: peer_public,
-        peer_endpoint: peer,
-        local_ipv4: ipv4,
-        local_ipv6: ipv6,
-        client_id: identity.client_id,
-        preshared_key: None,
-        persistent_keepalive: Some(keepalive),
-        aethernoize: std::sync::Arc::new(profile),
-    };
+    log::info!("[*] [{label}] validating WireGuard tunnel with {peer} (handshake + data-plane)...");
+    let (_, session) = wireguard::verify_endpoint_keep_session(
+        peer,
+        private_key,
+        peer_public,
+        identity.client_id,
+        ipv4,
+        &profile,
+        wg_tunnel_validate_timeout(),
+        Some(keepalive),
+    )
+    .await
+    .map_err(|e| AetherError::Other(format!("[{label}] tunnel failed validation: {e}")))?;
+    log::info!("[+] [{label}] wireguard tunnel validated (end-to-end data confirmed)");
 
-    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(1024);
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(1024);
+    let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(sysprofile::channel_capacity());
 
-    let tunnel = wireguard::WgTunnel::new(cfg, inbound_tx).await?;
+    let tunnel = wireguard::WgTunnel::from_established(
+        session,
+        std::sync::Arc::new(profile),
+        inbound_tx,
+        ipv4,
+    );
     let stack = netstack::spawn(&identity.ipv4, &identity.ipv6, mtu, inbound_rx, outbound_tx)?;
 
     tokio::spawn(async move {
@@ -968,8 +1148,6 @@ async fn run_warp_in_warp(
     log::info!("[*] establishing outer WARP tunnel to {peer}...");
     let outer_stack = establish_wg(&primary, peer, TUNNEL_MTU, true, 5, "outer").await?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
     let forwarder = spawn_udp_forwarder(&outer_stack, peer).await?;
     log::info!("[+] inner endpoint tunneled through outer warp via {forwarder}");
 
@@ -1000,20 +1178,20 @@ async fn prompt_line(prompt: &str) -> Option<String> {
     }
 }
 
+const SCAN_MODE_PROMPT: &str = "\nScan mode:\n  [1] turbo     (fast, first hit)\n  [2] balanced  (default)\n  [3] thorough  (deep, best ping)\n  [4] stealth   (quiet, patient)\n  [5] ironclad  (real tunnel + real HTTP check per candidate, guaranteed working)\nChoose [1-5] (default 2): ";
+
 async fn select_scan_mode() -> prober::ScanMode {
     if let Ok(v) = std::env::var("AETHER_SCAN") {
         return prober::ScanMode::parse(&v);
     }
 
-    let answer = prompt_line(
-        "\nScan mode:\n  [1] turbo     (fast, first hit)\n  [2] balanced  (default)\n  [3] thorough  (deep, best ping)\n  [4] stealth   (quiet, patient)\nChoose [1-4] (default 2): ",
-    )
-    .await;
+    let answer = prompt_line(SCAN_MODE_PROMPT).await;
 
     match answer.as_deref() {
         Some("1") => prober::ScanMode::Turbo,
         Some("3") => prober::ScanMode::Thorough,
         Some("4") => prober::ScanMode::Stealth,
+        Some("5") => prober::ScanMode::Ironclad,
         _ => prober::ScanMode::Balanced,
     }
 }
@@ -1023,15 +1201,13 @@ async fn select_scan_mode_str() -> String {
         return v;
     }
 
-    let answer = prompt_line(
-        "\nScan mode:\n  [1] turbo     (fast, first hit)\n  [2] balanced  (default)\n  [3] thorough  (deep, best ping)\n  [4] stealth   (quiet, patient)\nChoose [1-4] (default 2): ",
-    )
-    .await;
+    let answer = prompt_line(SCAN_MODE_PROMPT).await;
 
     match answer.as_deref() {
         Some("1") => "turbo".to_string(),
         Some("3") => "thorough".to_string(),
         Some("4") => "stealth".to_string(),
+        Some("5") => "ironclad".to_string(),
         _ => "balanced".to_string(),
     }
 }

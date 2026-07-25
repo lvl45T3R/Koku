@@ -26,6 +26,8 @@ mod prober;
 mod quic;
 #[path = "../../engine/aether/src/socks.rs"]
 mod socks;
+#[path = "../../engine/aether/src/sysprofile.rs"]
+mod sysprofile;
 #[path = "../../engine/aether/src/tls.rs"]
 mod tls;
 #[path = "../../engine/aether/src/tunnelping.rs"]
@@ -131,6 +133,7 @@ pub extern "system" fn Java_io_github_lvl45t3r_koku_AetherNative_nativeStart(
     log_sink: JObject,
 ) -> jlong {
     init_logging();
+    sysprofile::log_summary();
     if let Err(err) = set_log_target(&mut env, log_sink) {
         log::error!("could not attach the in-app logger: {err}");
     }
@@ -398,6 +401,7 @@ async fn run_wireguard(
                     local_ipv4,
                     &profile,
                     std::time::Duration::from_secs(6),
+                    None,
                 ) => Some(value),
                 _ = &mut *stop => None,
             };
@@ -574,6 +578,8 @@ async fn run_masque(
                 key_pem: identity.key_pem.clone(),
                 local_ipv4,
                 quiet: false,
+                pin_endpoint: true,
+                expected_pins: consts::MASQUE_PINS.iter().map(|pin| pin.to_vec()).collect(),
             };
             tokio::spawn(masque_h2::run(h2, internals, None, Some(ready_tx)))
         } else {
@@ -651,6 +657,8 @@ async fn verify_masque_peer(
             key_pem: identity.key_pem.clone(),
             local_ipv4,
             quiet: true,
+            pin_endpoint: true,
+            expected_pins: consts::MASQUE_PINS.iter().map(|pin| pin.to_vec()).collect(),
         };
         return masque_h2::verify_h2(&cfg, std::time::Duration::from_secs(6)).await;
     }

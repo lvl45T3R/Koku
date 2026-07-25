@@ -81,6 +81,14 @@ Ironclad scan probes run an isolated Aether netstack and real HTTP request.
 Each temporary probe tunnel is wrapped in an abort guard, so cancellation or a
 timeout terminates its background task.
 
+MASQUE HTTP/2 and HTTP/3 connections verify the server certificate against the
+SPKI pins shipped by Aether v1.4. WireGuard sends periodic data-plane probes;
+if no valid response arrives within the stale timeout, the transport ends and
+the Android reconnect supervisor takes over. Reader, driver, and worker tasks
+are aborted when their transport exits so repeated reconnects do not accumulate
+idle work. Scan concurrency, socket buffers, netstack buffers, and channel
+sizes are selected from the device CPU and memory profile.
+
 ## Current scope
 
 - ABI: `arm64-v8a`

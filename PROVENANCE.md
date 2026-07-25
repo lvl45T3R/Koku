@@ -15,15 +15,17 @@ both vendored under `engine/`.
 
 The vendored snapshot is intentionally stored without upstream Git metadata.
 `engine/REVISION` records the upstream Aether release and commit used by the
-Android build. The current transport port is based on Aether `v1.3.0` at
-`7af49ed`.
+Android build. The current transport port is based on Aether `v1.4.0` at
+`ee5a5f5`.
 
 ## Reused source
 
 `native/src/lib.rs` includes the required Aether modules from
 `engine/aether/src`. This covers endpoint discovery, account provisioning,
 MASQUE, HTTP/2, WireGuard, TLS, fragmentation, and obfuscation behavior.
-It also includes Aether v1.3's Ironclad tunnel probe and probe-task cleanup.
+It also includes Aether's Ironclad tunnel probe, MASQUE SPKI certificate
+pinning, reconnect task cleanup, WireGuard dead-tunnel detection, and adaptive
+runtime tuning from Aether v1.4.
 
 `native/Cargo.toml` resolves the local transport dependencies from the same
 repository:

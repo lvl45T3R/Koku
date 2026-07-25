@@ -23,7 +23,7 @@ The current package targets `arm64-v8a` and IPv4 traffic.
 ## Gateway scan modes
 
 - **Fast** uses Aether's Turbo handshake scan and remains the default.
-- **Reliable** uses Aether v1.3's Ironclad scan. It opens a real tunnel and
+- **Reliable** uses Aether's Ironclad scan. It opens a real tunnel and
   completes an end-to-end HTTP request before accepting a gateway.
 
 Reliable mode takes longer, but avoids selecting endpoints that answer a
@@ -32,6 +32,10 @@ handshake without carrying real traffic.
 The native worker also keeps the Android TUN active after a transport drop. It
 rechecks the last known-good MASQUE or WireGuard endpoint first and only starts
 a full scan when that endpoint is no longer usable.
+
+The Aether v1.4 engine update pins MASQUE server certificates, detects silent
+WireGuard tunnels through real data-plane health probes, cleans up transport
+tasks on reconnect, and scales scan and buffer sizes to the device.
 
 ## Interface
 

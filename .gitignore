@@ -3,6 +3,7 @@
 local.properties
 build/
 **/build/
+**/target/
 captures/
 .externalNativeBuild/
 .cxx/

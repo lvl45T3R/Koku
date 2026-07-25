@@ -66,15 +66,15 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## بیلد منتشرشده
 
-نسخهٔ آمادهٔ نصب `0.2.0` پس از گذراندن کنترل‌های بالا در مسیر زیر قرار
+نسخهٔ آمادهٔ نصب `0.3.0` پس از گذراندن کنترل‌های بالا در مسیر زیر قرار
 می‌گیرد:
 
 ```text
-releases/Koku-v0.2.0-arm64-v8a-debug.apk
+releases/Koku-v0.3.0-arm64-v8a-debug.apk
 ```
 
 یادداشت تغییرات، اطلاعات بسته و مقدار SHA-256 در
-[`releases/Koku-v0.2.0.md`](releases/Koku-v0.2.0.md) ثبت می‌شود.
+[`releases/Koku-v0.3.0.md`](releases/Koku-v0.3.0.md) ثبت می‌شود.
 
 اطلاعات دقیق منشأ کد در [PROVENANCE.md](PROVENANCE.md) و مرز فنی JNI در
 [NATIVE_ENGINE.md](NATIVE_ENGINE.md) ثبت شده است.
