@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.offset
@@ -70,6 +71,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
@@ -122,12 +124,25 @@ private enum class AppTab {
     SETTINGS,
 }
 
+enum class PerAppProxyMode(val wireName: String) {
+    ALL("all"),
+    SELECTED("selected"),
+    BYPASS("bypass"),
+}
+
+private data class AppProxyEntry(
+    val label: String,
+    val packageName: String,
+)
+
 @Composable
 private fun AetherScreen() {
     val context = LocalContext.current
     var selectedTab by remember { mutableStateOf(AppTab.HOME) }
     var protocol by remember { mutableStateOf("masque-h3") }
     var scanMode by remember { mutableStateOf("turbo") }
+    var perAppProxyMode by remember { mutableStateOf(loadPerAppProxyMode(context)) }
+    var proxyPackages by remember { mutableStateOf(loadPerAppProxyPackages(context)) }
     val logs by AetherNative.logs.collectAsState()
     val tunnelState by AetherNative.tunnelState.collectAsState()
     val traffic by AetherNative.traffic.collectAsState()
@@ -143,7 +158,7 @@ private fun AetherScreen() {
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            AetherVpnService.start(context, protocol, scanMode)
+            AetherVpnService.start(context, protocol, scanMode, perAppProxyMode, proxyPackages)
         } else {
             AetherNative.markStopped()
             AetherNative.log("WARN", "VPN permission denied")
@@ -165,7 +180,7 @@ private fun AetherScreen() {
         if (permissionIntent != null) {
             vpnPermission.launch(permissionIntent)
         } else {
-            AetherVpnService.start(context, protocol, scanMode)
+            AetherVpnService.start(context, protocol, scanMode, perAppProxyMode, proxyPackages)
         }
     }
 
@@ -255,9 +270,23 @@ private fun AetherScreen() {
                 AppTab.SETTINGS -> SettingsScreen(
                     protocol = protocol,
                     scanMode = scanMode,
+                    perAppProxyMode = perAppProxyMode,
+                    selectedPackages = proxyPackages,
                     protocolEnabled = startEnabled,
                     onProtocolChange = { protocol = it },
                     onScanModeChange = { scanMode = it },
+                    onPerAppModeChange = {
+                        perAppProxyMode = it
+                        savePerAppProxyMode(context, it)
+                    },
+                    onPackageToggle = { packageName ->
+                        proxyPackages = if (packageName in proxyPackages) {
+                            proxyPackages - packageName
+                        } else {
+                            proxyPackages + packageName
+                        }
+                        savePerAppProxyPackages(context, proxyPackages)
+                    },
                 )
             }
         }
@@ -374,7 +403,8 @@ private fun ConnectButton(
 ) {
     val connected = state == TunnelState.CONNECTED
     val busy = state == TunnelState.STARTING || state == TunnelState.STOPPING
-    val enabled = if (connected || state == TunnelState.FAILED) stopEnabled else startEnabled
+    val stoppable = connected || state == TunnelState.STARTING || state == TunnelState.FAILED
+    val enabled = if (stoppable) stopEnabled else startEnabled
     Box(contentAlignment = Alignment.Center) {
         Surface(
             modifier = Modifier
@@ -389,7 +419,7 @@ private fun ConnectButton(
                 .clickable(
                     enabled = enabled,
                     onClick = {
-                        if (connected || state == TunnelState.FAILED) onStop() else onStart()
+                        if (stoppable) onStop() else onStart()
                     },
                 ),
             shape = CircleShape,
@@ -725,10 +755,16 @@ private fun DebugControlButton(
 private fun SettingsScreen(
     protocol: String,
     scanMode: String,
+    perAppProxyMode: PerAppProxyMode,
+    selectedPackages: Set<String>,
     protocolEnabled: Boolean,
     onProtocolChange: (String) -> Unit,
     onScanModeChange: (String) -> Unit,
+    onPerAppModeChange: (PerAppProxyMode) -> Unit,
+    onPackageToggle: (String) -> Unit,
 ) {
+    val context = LocalContext.current
+    val apps = remember { loadInstalledProxyApps(context) }
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -824,6 +860,72 @@ private fun SettingsScreen(
             }
         }
 
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White),
+        ) {
+            Column(
+                modifier = Modifier.padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text("Per-app proxy", fontWeight = FontWeight.Bold)
+                ProtocolOption(
+                    label = "All apps",
+                    detail = "Proxy everything",
+                    value = PerAppProxyMode.ALL.wireName,
+                    selected = perAppProxyMode.wireName,
+                    enabled = protocolEnabled,
+                    onSelect = { onPerAppModeChange(PerAppProxyMode.ALL) },
+                )
+                ProtocolOption(
+                    label = "Selected only",
+                    detail = "${selectedPackages.size} selected",
+                    value = PerAppProxyMode.SELECTED.wireName,
+                    selected = perAppProxyMode.wireName,
+                    enabled = protocolEnabled && selectedPackages.isNotEmpty(),
+                    onSelect = { onPerAppModeChange(PerAppProxyMode.SELECTED) },
+                )
+                ProtocolOption(
+                    label = "Bypass selected",
+                    detail = "${selectedPackages.size} bypassed",
+                    value = PerAppProxyMode.BYPASS.wireName,
+                    selected = perAppProxyMode.wireName,
+                    enabled = protocolEnabled,
+                    onSelect = { onPerAppModeChange(PerAppProxyMode.BYPASS) },
+                )
+                if (!protocolEnabled) {
+                    Text(
+                        "Disconnect before changing per-app proxy.",
+                        color = Muted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                } else if (apps.isEmpty()) {
+                    Text(
+                        "No launchable apps were visible to Koku.",
+                        color = Muted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 230.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(apps) { app ->
+                            AppProxyOption(
+                                app = app,
+                                selected = app.packageName in selectedPackages,
+                                enabled = protocolEnabled,
+                                onToggle = { onPackageToggle(app.packageName) },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         Spacer(Modifier.weight(1f))
         Text(
             "Koku · Powered by Aether",
@@ -833,6 +935,53 @@ private fun SettingsScreen(
             style = MaterialTheme.typography.labelSmall,
         )
     }
+}
+
+@Composable
+private fun AppProxyOption(
+    app: AppProxyEntry,
+    selected: Boolean,
+    enabled: Boolean,
+    onToggle: () -> Unit,
+) {
+    FilterChip(
+        selected = selected,
+        onClick = onToggle,
+        enabled = enabled,
+        label = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+            ) {
+                Text(
+                    app.label,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    app.packageName,
+                    color = if (selected) Color.White.copy(alpha = 0.82f) else Muted,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        },
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = Ink,
+            selectedLabelColor = Color.White,
+        ),
+        border = FilterChipDefaults.filterChipBorder(
+            enabled = enabled,
+            selected = selected,
+            borderColor = Color(0xFFE1D8D6),
+            selectedBorderColor = Ink,
+        ),
+    )
 }
 
 @Composable
@@ -982,6 +1131,57 @@ private fun testButtonLabel(state: ConnectionTestState): String = when (state) {
     ConnectionTestState.RUNNING -> "Testing Google…"
     ConnectionTestState.PASSED -> "Test Google again"
     ConnectionTestState.FAILED -> "Retry Google test"
+}
+
+private const val SETTINGS_PREFS = "koku_settings"
+private const val PREF_PER_APP_PROXY_MODE = "per_app_proxy_mode"
+private const val PREF_PER_APP_PROXY_PACKAGES = "per_app_proxy_packages"
+
+private fun loadPerAppProxyMode(context: Context): PerAppProxyMode {
+    val stored = context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
+        .getString(PREF_PER_APP_PROXY_MODE, PerAppProxyMode.ALL.wireName)
+    return PerAppProxyMode.values().firstOrNull { it.wireName == stored } ?: PerAppProxyMode.ALL
+}
+
+private fun savePerAppProxyMode(context: Context, mode: PerAppProxyMode) {
+    context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(PREF_PER_APP_PROXY_MODE, mode.wireName)
+        .apply()
+}
+
+private fun loadPerAppProxyPackages(context: Context): Set<String> {
+    return context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
+        .getStringSet(PREF_PER_APP_PROXY_PACKAGES, emptySet())
+        ?.toSet()
+        ?: emptySet()
+}
+
+private fun savePerAppProxyPackages(context: Context, packages: Set<String>) {
+    context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putStringSet(PREF_PER_APP_PROXY_PACKAGES, packages)
+        .apply()
+}
+
+private fun loadInstalledProxyApps(context: Context): List<AppProxyEntry> {
+    val packageManager = context.packageManager
+    val launchIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    return packageManager.queryIntentActivities(launchIntent, 0)
+        .mapNotNull { resolveInfo ->
+            val activityInfo = resolveInfo.activityInfo ?: return@mapNotNull null
+            val appInfo = activityInfo.applicationInfo ?: return@mapNotNull null
+            val packageName = appInfo.packageName
+            if (packageName == context.packageName) {
+                return@mapNotNull null
+            }
+            AppProxyEntry(
+                label = appInfo.loadLabel(packageManager).toString(),
+                packageName = packageName,
+            )
+        }
+        .distinctBy { it.packageName }
+        .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
 }
 
 private fun formatBytes(bytes: Long): String = when {

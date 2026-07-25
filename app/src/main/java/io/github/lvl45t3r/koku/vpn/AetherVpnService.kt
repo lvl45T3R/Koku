@@ -12,6 +12,7 @@ import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import io.github.lvl45t3r.koku.AetherNative
 import io.github.lvl45t3r.koku.MainActivity
+import io.github.lvl45t3r.koku.PerAppProxyMode
 import io.github.lvl45t3r.koku.R
 import io.github.lvl45t3r.koku.TunnelState
 
@@ -32,6 +33,8 @@ class AetherVpnService : VpnService() {
                 startTunnel(
                     intent.getStringExtra(EXTRA_PROTOCOL) ?: "masque-h3",
                     intent.getStringExtra(EXTRA_SCAN_MODE) ?: "turbo",
+                    intent.getStringExtra(EXTRA_PER_APP_MODE) ?: PerAppProxyMode.ALL.wireName,
+                    intent.getStringArrayListExtra(EXTRA_PER_APP_PACKAGES)?.toSet() ?: emptySet(),
                 )
             }.onFailure { error ->
                 AetherNative.log(
@@ -50,7 +53,12 @@ class AetherVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startTunnel(protocol: String, scanMode: String) {
+    private fun startTunnel(
+        protocol: String,
+        scanMode: String,
+        perAppMode: String,
+        perAppPackages: Set<String>,
+    ) {
         if (AetherNative.tunnelState.value != TunnelState.STARTING) {
             AetherNative.markStarting()
         }
@@ -70,19 +78,21 @@ class AetherVpnService : VpnService() {
         }
 
         AetherNative.log("INFO", "Creating Android TUN interface 172.31.19.2/32")
-        val descriptor = Builder()
+        val builder = Builder()
             .setSession("Koku")
             .setMtu(1280)
             .addAddress("172.31.19.2", 32)
             .addDnsServer("1.1.1.1")
             .addRoute("0.0.0.0", 0)
-            .addDisallowedApplication(packageName)
             .also { builder ->
                 if (Build.VERSION.SDK_INT >= 29) {
                     builder.setMetered(false)
                 }
             }
-            .establish()
+
+        configurePerAppProxy(builder, perAppMode, perAppPackages)
+
+        val descriptor = builder.establish()
             ?: throw IllegalStateException("Unable to establish VPN interface")
 
         tun = descriptor
@@ -104,6 +114,71 @@ class AetherVpnService : VpnService() {
             stopSelf()
         } else {
             AetherNative.log("INFO", "Native worker started (handle=$nativeHandle)")
+        }
+    }
+
+    private fun configurePerAppProxy(
+        builder: Builder,
+        mode: String,
+        selectedPackages: Set<String>,
+    ) {
+        val packages = selectedPackages
+            .filter { it.isNotBlank() && it != packageName }
+            .toSortedSet()
+
+        when (mode) {
+            PerAppProxyMode.SELECTED.wireName -> {
+                if (packages.isEmpty()) {
+                    AetherNative.log(
+                        "WARN",
+                        "Per-app proxy selected-only mode has no apps; falling back to all apps",
+                    )
+                    addDisallowedPackage(builder, packageName)
+                } else {
+                    val includedCount = packages.count { addAllowedPackage(builder, it) }
+                    if (includedCount == 0) {
+                        AetherNative.log(
+                            "WARN",
+                            "No selected apps could be included; falling back to all apps",
+                        )
+                        addDisallowedPackage(builder, packageName)
+                    } else {
+                        AetherNative.log(
+                            "INFO",
+                            "Per-app proxy mode: selected apps only ($includedCount)",
+                        )
+                    }
+                }
+            }
+            PerAppProxyMode.BYPASS.wireName -> {
+                addDisallowedPackage(builder, packageName)
+                packages.forEach { addDisallowedPackage(builder, it) }
+                AetherNative.log(
+                    "INFO",
+                    "Per-app proxy mode: bypass selected apps (${packages.size})",
+                )
+            }
+            else -> {
+                addDisallowedPackage(builder, packageName)
+                AetherNative.log("INFO", "Per-app proxy mode: all apps")
+            }
+        }
+    }
+
+    private fun addAllowedPackage(builder: Builder, targetPackage: String): Boolean {
+        return runCatching {
+            builder.addAllowedApplication(targetPackage)
+            true
+        }.onFailure {
+            AetherNative.log("WARN", "Cannot include $targetPackage in per-app proxy: ${it.message}")
+        }.getOrDefault(false)
+    }
+
+    private fun addDisallowedPackage(builder: Builder, targetPackage: String) {
+        runCatching {
+            builder.addDisallowedApplication(targetPackage)
+        }.onFailure {
+            AetherNative.log("WARN", "Cannot bypass $targetPackage from per-app proxy: ${it.message}")
         }
     }
 
@@ -152,14 +227,27 @@ class AetherVpnService : VpnService() {
         private const val ACTION_STOP = "io.github.lvl45t3r.koku.STOP"
         private const val EXTRA_PROTOCOL = "protocol"
         private const val EXTRA_SCAN_MODE = "scanMode"
+        private const val EXTRA_PER_APP_MODE = "perAppMode"
+        private const val EXTRA_PER_APP_PACKAGES = "perAppPackages"
         private const val CHANNEL_ID = "aether_vpn"
         private const val NOTIFICATION_ID = 1819
 
-        fun start(context: Context, protocol: String, scanMode: String) {
+        fun start(
+            context: Context,
+            protocol: String,
+            scanMode: String,
+            perAppMode: PerAppProxyMode,
+            perAppPackages: Set<String>,
+        ) {
             val intent = Intent(context, AetherVpnService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_PROTOCOL, protocol)
                 .putExtra(EXTRA_SCAN_MODE, scanMode)
+                .putExtra(EXTRA_PER_APP_MODE, perAppMode.wireName)
+                .putStringArrayListExtra(
+                    EXTRA_PER_APP_PACKAGES,
+                    ArrayList(perAppPackages.toList()),
+                )
             if (Build.VERSION.SDK_INT >= 26) {
                 context.startForegroundService(intent)
             } else {
