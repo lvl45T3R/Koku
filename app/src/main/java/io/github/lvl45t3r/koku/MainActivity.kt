@@ -60,6 +60,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -74,9 +75,17 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
-import kotlinx.coroutines.delay
 import io.github.lvl45t3r.koku.vpn.AetherVpnService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 
 private val AetherRed = Color(0xFFE20D1D)
 private val AetherDarkRed = Color(0xFF9F0712)
@@ -84,6 +93,8 @@ private val Ink = Color(0xFF121113)
 private val Canvas = Color(0xFFF7F4F2)
 private val Muted = Color(0xFF716A6B)
 private val Online = Color(0xFF138A5B)
+private const val KOKU_REPOSITORY_URL = "https://github.com/lvl45T3R/Koku"
+private const val KOKU_LATEST_RELEASE_API = "https://api.github.com/repos/lvl45T3R/Koku/releases/latest"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -765,60 +776,105 @@ private fun SettingsScreen(
 ) {
     val context = LocalContext.current
     val apps = remember { loadInstalledProxyApps(context) }
-    Column(
+    val scope = rememberCoroutineScope()
+    var updateStatus by remember { mutableStateOf("Current version: ${appVersionName(context)}") }
+    var updateInProgress by remember { mutableStateOf(false) }
+    LazyColumn(
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 20.dp, vertical = 18.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Text(
-            "Settings",
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.Black,
-        )
-        Text(
-            "Connection preferences",
-            color = Muted,
-            style = MaterialTheme.typography.bodyMedium,
-        )
+        item {
+            Text(
+                "Settings",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Black,
+            )
+        }
+        item {
+            Text(
+                "Connection preferences",
+                color = Muted,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
 
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White),
-        ) {
-            Column(
-                modifier = Modifier.padding(18.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
             ) {
-                Text("Tunnel protocol", fontWeight = FontWeight.Bold)
-                ProtocolOption(
-                    label = "MASQUE H3",
-                    detail = "Fast QUIC transport",
-                    value = "masque-h3",
-                    selected = protocol,
-                    enabled = protocolEnabled,
-                    onSelect = onProtocolChange,
-                )
-                ProtocolOption(
-                    label = "MASQUE H2",
-                    detail = "HTTPS-compatible transport",
-                    value = "masque-h2",
-                    selected = protocol,
-                    enabled = protocolEnabled,
-                    onSelect = onProtocolChange,
-                )
-                ProtocolOption(
-                    label = "WireGuard",
-                    detail = "Classic UDP tunnel",
-                    value = "wireguard",
-                    selected = protocol,
-                    enabled = protocolEnabled,
-                    onSelect = onProtocolChange,
-                )
-                if (!protocolEnabled) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text("Tunnel protocol", fontWeight = FontWeight.Bold)
+                    ProtocolOption(
+                        label = "MASQUE H3",
+                        detail = "Fast QUIC transport",
+                        value = "masque-h3",
+                        selected = protocol,
+                        enabled = protocolEnabled,
+                        onSelect = onProtocolChange,
+                    )
+                    ProtocolOption(
+                        label = "MASQUE H2",
+                        detail = "HTTPS-compatible transport",
+                        value = "masque-h2",
+                        selected = protocol,
+                        enabled = protocolEnabled,
+                        onSelect = onProtocolChange,
+                    )
+                    ProtocolOption(
+                        label = "WireGuard",
+                        detail = "Classic UDP tunnel",
+                        value = "wireguard",
+                        selected = protocol,
+                        enabled = protocolEnabled,
+                        onSelect = onProtocolChange,
+                    )
+                    if (!protocolEnabled) {
+                        Text(
+                            "Disconnect before changing protocol.",
+                            color = Muted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
+        }
+
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text("Gateway scan", fontWeight = FontWeight.Bold)
+                    ProtocolOption(
+                        label = "Fast",
+                        detail = "Turbo handshake scan",
+                        value = "turbo",
+                        selected = scanMode,
+                        enabled = protocolEnabled,
+                        onSelect = onScanModeChange,
+                    )
+                    ProtocolOption(
+                        label = "Reliable",
+                        detail = "Real tunnel + HTTP check",
+                        value = "ironclad",
+                        selected = scanMode,
+                        enabled = protocolEnabled,
+                        onSelect = onScanModeChange,
+                    )
                     Text(
-                        "Disconnect before changing protocol.",
+                        "Reliable takes longer, but only selects a gateway after an end-to-end request succeeds.",
                         color = Muted,
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -826,114 +882,145 @@ private fun SettingsScreen(
             }
         }
 
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White),
-        ) {
-            Column(
-                modifier = Modifier.padding(18.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
             ) {
-                Text("Gateway scan", fontWeight = FontWeight.Bold)
-                ProtocolOption(
-                    label = "Fast",
-                    detail = "Turbo handshake scan",
-                    value = "turbo",
-                    selected = scanMode,
-                    enabled = protocolEnabled,
-                    onSelect = onScanModeChange,
-                )
-                ProtocolOption(
-                    label = "Reliable",
-                    detail = "Real tunnel + HTTP check",
-                    value = "ironclad",
-                    selected = scanMode,
-                    enabled = protocolEnabled,
-                    onSelect = onScanModeChange,
-                )
-                Text(
-                    "Reliable takes longer, but only selects a gateway after an end-to-end request succeeds.",
-                    color = Muted,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-        }
-
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White),
-        ) {
-            Column(
-                modifier = Modifier.padding(18.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                Text("Per-app proxy", fontWeight = FontWeight.Bold)
-                ProtocolOption(
-                    label = "All apps",
-                    detail = "Proxy everything",
-                    value = PerAppProxyMode.ALL.wireName,
-                    selected = perAppProxyMode.wireName,
-                    enabled = protocolEnabled,
-                    onSelect = { onPerAppModeChange(PerAppProxyMode.ALL) },
-                )
-                ProtocolOption(
-                    label = "Selected only",
-                    detail = "${selectedPackages.size} selected",
-                    value = PerAppProxyMode.SELECTED.wireName,
-                    selected = perAppProxyMode.wireName,
-                    enabled = protocolEnabled && selectedPackages.isNotEmpty(),
-                    onSelect = { onPerAppModeChange(PerAppProxyMode.SELECTED) },
-                )
-                ProtocolOption(
-                    label = "Bypass selected",
-                    detail = "${selectedPackages.size} bypassed",
-                    value = PerAppProxyMode.BYPASS.wireName,
-                    selected = perAppProxyMode.wireName,
-                    enabled = protocolEnabled,
-                    onSelect = { onPerAppModeChange(PerAppProxyMode.BYPASS) },
-                )
-                if (!protocolEnabled) {
-                    Text(
-                        "Disconnect before changing per-app proxy.",
-                        color = Muted,
-                        style = MaterialTheme.typography.bodySmall,
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text("Per-app proxy", fontWeight = FontWeight.Bold)
+                    ProtocolOption(
+                        label = "All apps",
+                        detail = "Proxy everything",
+                        value = PerAppProxyMode.ALL.wireName,
+                        selected = perAppProxyMode.wireName,
+                        enabled = protocolEnabled,
+                        onSelect = { onPerAppModeChange(PerAppProxyMode.ALL) },
                     )
-                } else if (apps.isEmpty()) {
-                    Text(
-                        "No launchable apps were visible to Koku.",
-                        color = Muted,
-                        style = MaterialTheme.typography.bodySmall,
+                    ProtocolOption(
+                        label = "Selected only",
+                        detail = "${selectedPackages.size} selected",
+                        value = PerAppProxyMode.SELECTED.wireName,
+                        selected = perAppProxyMode.wireName,
+                        enabled = protocolEnabled && selectedPackages.isNotEmpty(),
+                        onSelect = { onPerAppModeChange(PerAppProxyMode.SELECTED) },
                     )
-                } else {
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 230.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        items(apps) { app ->
-                            AppProxyOption(
-                                app = app,
-                                selected = app.packageName in selectedPackages,
-                                enabled = protocolEnabled,
-                                onToggle = { onPackageToggle(app.packageName) },
-                            )
+                    ProtocolOption(
+                        label = "Bypass selected",
+                        detail = "${selectedPackages.size} bypassed",
+                        value = PerAppProxyMode.BYPASS.wireName,
+                        selected = perAppProxyMode.wireName,
+                        enabled = protocolEnabled,
+                        onSelect = { onPerAppModeChange(PerAppProxyMode.BYPASS) },
+                    )
+                    if (!protocolEnabled) {
+                        Text(
+                            "Disconnect before changing per-app proxy.",
+                            color = Muted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    } else if (apps.isEmpty()) {
+                        Text(
+                            "No launchable apps were visible to Koku.",
+                            color = Muted,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 230.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            items(apps) { app ->
+                                AppProxyOption(
+                                    app = app,
+                                    selected = app.packageName in selectedPackages,
+                                    enabled = protocolEnabled,
+                                    onToggle = { onPackageToggle(app.packageName) },
+                                )
+                            }
                         }
                     }
                 }
             }
         }
 
-        Spacer(Modifier.weight(1f))
-        Text(
-            "Koku · Powered by Aether",
-            modifier = Modifier.fillMaxWidth(),
-            textAlign = TextAlign.Center,
-            color = Muted,
-            style = MaterialTheme.typography.labelSmall,
-        )
+        item {
+            UpdateCard(
+                status = updateStatus,
+                checking = updateInProgress,
+                onCheckUpdate = {
+                    updateInProgress = true
+                    updateStatus = "Checking GitHub releases..."
+                    scope.launch {
+                        updateStatus = checkForUpdateAndInstall(context)
+                        updateInProgress = false
+                    }
+                },
+                onOpenRepository = {
+                    openUrl(context, KOKU_REPOSITORY_URL)
+                },
+            )
+        }
+
+        item {
+            Text(
+                "Koku · Powered by Aether",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 14.dp),
+                textAlign = TextAlign.Center,
+                color = Muted,
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
+    }
+}
+
+@Composable
+private fun UpdateCard(
+    status: String,
+    checking: Boolean,
+    onCheckUpdate: () -> Unit,
+    onOpenRepository: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text("Updates", fontWeight = FontWeight.Bold)
+            Button(
+                enabled = !checking,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = AetherRed),
+                onClick = onCheckUpdate,
+            ) {
+                Text(
+                    if (checking) "Checking..." else "Check for update",
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            OutlinedButton(
+                enabled = !checking,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                onClick = onOpenRepository,
+            ) {
+                Text("Open repository", fontWeight = FontWeight.Bold)
+            }
+            Text(status, color = Muted, style = MaterialTheme.typography.bodySmall)
+        }
     }
 }
 
@@ -1182,6 +1269,130 @@ private fun loadInstalledProxyApps(context: Context): List<AppProxyEntry> {
         }
         .distinctBy { it.packageName }
         .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
+}
+
+private fun appVersionName(context: Context): String {
+    return runCatching {
+        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "0.0.0"
+    }.getOrDefault("0.0.0")
+}
+
+private suspend fun checkForUpdateAndInstall(context: Context): String = withContext(Dispatchers.IO) {
+    runCatching {
+        val releaseJson = httpGetText(KOKU_LATEST_RELEASE_API)
+        val release = JSONObject(releaseJson)
+        val latestVersion = release.getString("tag_name").removePrefix("v")
+        val currentVersion = appVersionName(context)
+        if (isNewerVersion(latestVersion, currentVersion)) {
+            val assets = release.getJSONArray("assets")
+            var apkUrl: String? = null
+            for (index in 0 until assets.length()) {
+                val asset = assets.getJSONObject(index)
+                val name = asset.optString("name")
+                if (name.endsWith(".apk") && "arm64-v8a" in name) {
+                    apkUrl = asset.getString("browser_download_url")
+                    break
+                }
+            }
+            val downloadUrl = apkUrl ?: return@runCatching "Latest release has no ARM64 APK asset."
+            val apk = downloadApk(context, latestVersion, downloadUrl)
+            withContext(Dispatchers.Main) {
+                installApk(context, apk)
+            }
+            "Downloaded Koku $latestVersion. Confirm installation to update."
+        } else {
+            "Koku is up to date: $currentVersion"
+        }
+    }.getOrElse { error ->
+        "Update failed: ${error.message ?: error.javaClass.simpleName}"
+    }
+}
+
+private fun httpGetText(url: String): String {
+    val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+        connectTimeout = 15_000
+        readTimeout = 20_000
+        requestMethod = "GET"
+        setRequestProperty("Accept", "application/vnd.github+json")
+        setRequestProperty("User-Agent", "Koku/${Build.VERSION.RELEASE}")
+    }
+    return connection.useResponse {
+        inputStream.bufferedReader().use { it.readText() }
+    }
+}
+
+private fun downloadApk(context: Context, version: String, url: String): File {
+    val updateDir = File(context.cacheDir, "updates").apply { mkdirs() }
+    val apk = File(updateDir, "Koku-v$version-arm64-v8a.apk")
+    val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+        connectTimeout = 15_000
+        readTimeout = 60_000
+        requestMethod = "GET"
+        setRequestProperty("User-Agent", "Koku/${Build.VERSION.RELEASE}")
+    }
+    connection.useResponse {
+        inputStream.use { input ->
+            apk.outputStream().use { output ->
+                input.copyTo(output)
+            }
+        }
+    }
+    return apk
+}
+
+private fun installApk(context: Context, apk: File) {
+    val uri = FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        apk,
+    )
+    val intent = Intent(Intent.ACTION_VIEW)
+        .setDataAndType(uri, "application/vnd.android.package-archive")
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    context.startActivity(intent)
+}
+
+private inline fun <T> HttpURLConnection.useResponse(block: HttpURLConnection.() -> T): T {
+    return try {
+        if (responseCode !in 200..299) {
+            val body = errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+            throw IllegalStateException("HTTP $responseCode $body".trim())
+        }
+        block()
+    } finally {
+        disconnect()
+    }
+}
+
+private fun isNewerVersion(latest: String, current: String): Boolean {
+    val latestParts = latest.versionParts()
+    val currentParts = current.versionParts()
+    val size = maxOf(latestParts.size, currentParts.size)
+    for (index in 0 until size) {
+        val latestValue = latestParts.getOrElse(index) { 0 }
+        val currentValue = currentParts.getOrElse(index) { 0 }
+        if (latestValue != currentValue) {
+            return latestValue > currentValue
+        }
+    }
+    return false
+}
+
+private fun String.versionParts(): List<Int> {
+    return split('.', '-', '_')
+        .mapNotNull { part -> part.takeWhile { it.isDigit() }.toIntOrNull() }
+}
+
+private fun openUrl(context: Context, url: String) {
+    runCatching {
+        context.startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                .addCategory(Intent.CATEGORY_BROWSABLE),
+        )
+    }.onFailure {
+        Toast.makeText(context, "Could not open repository", Toast.LENGTH_SHORT).show()
+    }
 }
 
 private fun formatBytes(bytes: Long): String = when {
