@@ -4,6 +4,7 @@ local.properties
 build/
 **/build/
 **/target/
+signing/
 captures/
 .externalNativeBuild/
 .cxx/

@@ -4,6 +4,18 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val requestedAbis = providers.gradleProperty("kokuAbis")
+    .orNull
+    ?.split(',')
+    ?.map(String::trim)
+    ?.filter(String::isNotEmpty)
+    ?: listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+
+val releaseStoreFile = System.getenv("KOKU_SIGNING_STORE_FILE")
+val releaseStorePassword = System.getenv("KOKU_SIGNING_STORE_PASSWORD")
+val releaseKeyAlias = System.getenv("KOKU_SIGNING_KEY_ALIAS")
+val releaseKeyPassword = System.getenv("KOKU_SIGNING_KEY_PASSWORD")
+
 android {
     namespace = "io.github.lvl45t3r.koku"
     compileSdk = 35
@@ -12,11 +24,34 @@ android {
         applicationId = "io.github.lvl45t3r.koku"
         minSdk = 24
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.3.2"
+        versionCode = 6
+        versionName = "0.3.3"
 
         ndk {
-            abiFilters += "arm64-v8a"
+            abiFilters += requestedAbis
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            if (
+                !releaseStoreFile.isNullOrBlank() &&
+                !releaseStorePassword.isNullOrBlank() &&
+                !releaseKeyAlias.isNullOrBlank() &&
+                !releaseKeyPassword.isNullOrBlank()
+            ) {
+                storeFile = file(releaseStoreFile)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = false
         }
     }
 

@@ -52,7 +52,7 @@ async fn handle_client(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
 
     match cmd {
         CMD_CONNECT => handle_connect(sock, stack, target, port).await,
-        CMD_UDP_ASSOCIATE => handle_udp_associate(sock, stack).await,
+        CMD_UDP_ASSOCIATE => handle_udp_associate(sock, stack, target).await,
         _ => {
             reply(&mut sock, REP_NOT_SUPPORTED).await?;
             Err(AetherError::Other("unsupported socks command".into()))
@@ -279,7 +279,37 @@ async fn handle_connect(
     Ok(())
 }
 
-async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result<()> {
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        other => other,
+    }
+}
+
+fn expected_udp_source(control_peer: SocketAddr, requested: &Target) -> IpAddr {
+    match requested {
+        Target::Ip(ip) if !ip.is_unspecified() => normalize_ip(*ip),
+        _ => normalize_ip(control_peer.ip()),
+    }
+}
+
+fn udp_source_allowed(expected_ip: IpAddr, latched: Option<SocketAddr>, from: SocketAddr) -> bool {
+    match latched {
+        Some(known) => known == from,
+        None => normalize_ip(from.ip()) == normalize_ip(expected_ip),
+    }
+}
+
+async fn handle_udp_associate(
+    mut sock: TcpStream,
+    stack: StackHandle,
+    requested: Target,
+) -> Result<()> {
+    let control_peer = sock.peer_addr()?;
+    let expected_ip = expected_udp_source(control_peer, &requested);
     let relay = UdpSocket::bind("127.0.0.1:0").await?;
     let relay_addr = relay.local_addr()?;
     reply_bound(&mut sock, relay_addr).await?;
@@ -288,6 +318,7 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
     let (sender, mut from_stack) = udp.into_split();
 
     let mut client: Option<SocketAddr> = None;
+    let mut refused: u64 = 0;
     let mut cbuf = vec![0u8; 65535];
     let mut ctrl = [0u8; 256];
 
@@ -295,7 +326,20 @@ async fn handle_udp_associate(mut sock: TcpStream, stack: StackHandle) -> Result
         tokio::select! {
             r = relay.recv_from(&mut cbuf) => {
                 let (n, from) = match r { Ok(v) => v, Err(_) => break };
-                client = Some(from);
+                if !udp_source_allowed(expected_ip, client, from) {
+                    refused += 1;
+                    if refused == 1 || refused % 64 == 0 {
+                        log::warn!(
+                            "[-] udp relay {relay_addr} dropped a datagram from {from}; \
+                             this association only serves {expected_ip} (refused={refused})"
+                        );
+                    }
+                    continue;
+                }
+                if client.is_none() {
+                    log::debug!("udp relay {relay_addr} latched to client {from}");
+                    client = Some(from);
+                }
                 if let Some((dst, payload)) = parse_udp_request(&cbuf[..n]) {
                     let dst = match dst {
                         Target::Ip(ip) => SocketAddr::new(ip, payload.0),

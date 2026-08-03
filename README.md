@@ -33,9 +33,11 @@ The native worker also keeps the Android TUN active after a transport drop. It
 rechecks the last known-good MASQUE or WireGuard endpoint first and only starts
 a full scan when that endpoint is no longer usable.
 
-The Aether v1.4 engine update pins MASQUE server certificates, detects silent
-WireGuard tunnels through real data-plane health probes, cleans up transport
-tasks on reconnect, and scales scan and buffer sizes to the device.
+The Android engine port now tracks Aether v1.5 transport fixes. It pins MASQUE
+server certificates, detects silent WireGuard tunnels, avoids netstack stalls
+under backpressure, validates tunnel DNS and HTTP probes, locks SOCKS UDP
+associations to their client, and scans Cloudflare ranges and ports in the
+documented order.
 
 ## Interface
 

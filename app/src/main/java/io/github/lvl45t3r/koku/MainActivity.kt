@@ -45,6 +45,8 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
@@ -775,10 +777,27 @@ private fun SettingsScreen(
     onPackageToggle: (String) -> Unit,
 ) {
     val context = LocalContext.current
-    val apps = remember { loadInstalledProxyApps(context) }
     val scope = rememberCoroutineScope()
+    var showAppPicker by remember { mutableStateOf(false) }
+    var installedApps by remember { mutableStateOf<List<AppProxyEntry>?>(null) }
+    var appPickerError by remember { mutableStateOf<String?>(null) }
     var updateStatus by remember { mutableStateOf("Current version: ${appVersionName(context)}") }
     var updateInProgress by remember { mutableStateOf(false) }
+
+    LaunchedEffect(showAppPicker) {
+        if (!showAppPicker || installedApps != null) {
+            return@LaunchedEffect
+        }
+        appPickerError = null
+        val result = withContext(Dispatchers.IO) {
+            runCatching { loadInstalledProxyApps(context) }
+        }
+        result.onSuccess { installedApps = it }
+            .onFailure { error ->
+                appPickerError = error.message ?: error.javaClass.simpleName
+            }
+    }
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -923,29 +942,27 @@ private fun SettingsScreen(
                             color = Muted,
                             style = MaterialTheme.typography.bodySmall,
                         )
-                    } else if (apps.isEmpty()) {
-                        Text(
-                            "No launchable apps were visible to Koku.",
-                            color = Muted,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    } else {
-                        LazyColumn(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 230.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            items(apps) { app ->
-                                AppProxyOption(
-                                    app = app,
-                                    selected = app.packageName in selectedPackages,
-                                    enabled = protocolEnabled,
-                                    onToggle = { onPackageToggle(app.packageName) },
-                                )
-                            }
-                        }
                     }
+                    OutlinedButton(
+                        enabled = protocolEnabled,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        onClick = {
+                            installedApps = null
+                            appPickerError = null
+                            showAppPicker = true
+                        },
+                    ) {
+                        Text(
+                            "Choose apps (${selectedPackages.size})",
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    Text(
+                        "The installed-app list is loaded only when this picker is opened.",
+                        color = Muted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
             }
         }
@@ -980,6 +997,85 @@ private fun SettingsScreen(
             )
         }
     }
+
+    if (showAppPicker) {
+        AppProxyPickerDialog(
+            apps = installedApps,
+            error = appPickerError,
+            selectedPackages = selectedPackages,
+            onPackageToggle = onPackageToggle,
+            onDismiss = { showAppPicker = false },
+        )
+    }
+}
+
+@Composable
+private fun AppProxyPickerDialog(
+    apps: List<AppProxyEntry>?,
+    error: String?,
+    selectedPackages: Set<String>,
+    onPackageToggle: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text("Choose apps", fontWeight = FontWeight.Black)
+                Text(
+                    "${selectedPackages.size} selected",
+                    color = Muted,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        },
+        text = {
+            when {
+                error != null -> Text(
+                    "Could not load installed apps: $error",
+                    color = MaterialTheme.colorScheme.error,
+                )
+                apps == null -> Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(180.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CircularProgressIndicator(color = AetherRed)
+                }
+                apps.isEmpty() -> Text(
+                    "No launchable apps were visible to Koku.",
+                    color = Muted,
+                )
+                else -> LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 430.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(apps, key = { it.packageName }) { app ->
+                        AppProxyOption(
+                            app = app,
+                            selected = app.packageName in selectedPackages,
+                            enabled = true,
+                            onToggle = { onPackageToggle(app.packageName) },
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = AetherRed),
+            ) {
+                Text("Done", fontWeight = FontWeight.Bold)
+            }
+        },
+        shape = RoundedCornerShape(24.dp),
+        containerColor = Color.White,
+    )
 }
 
 @Composable

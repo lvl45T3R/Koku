@@ -124,6 +124,21 @@ fn default_noize() -> String {
     "balanced".into()
 }
 
+fn profile_candidates(primary: &str, wireguard: bool) -> Vec<String> {
+    let fallbacks: &[&str] = if wireguard {
+        &["balanced", "aggressive", "light", "off"]
+    } else {
+        &["firewall", "gfw", "off"]
+    };
+    let mut names = vec![primary.to_lowercase()];
+    for fallback in fallbacks {
+        if !names.iter().any(|name| name.eq_ignore_ascii_case(fallback)) {
+            names.push((*fallback).to_string());
+        }
+    }
+    names
+}
+
 #[no_mangle]
 pub extern "system" fn Java_io_github_lvl45t3r_koku_AetherNative_nativeStart(
     mut env: JNIEnv,
@@ -375,16 +390,8 @@ async fn run_wireguard(
         .unwrap_or(&identity.ipv6)
         .parse()
         .map_err(|_| AetherError::Other("invalid identity IPv6".into()))?;
-    let profile = aethernoize::from_profile(&cfg.noize_profile);
-    let probe = wg_prober::WgProbe {
-        private_key: Arc::new(private_key),
-        peer_public_key: Arc::new(public_key),
-        client_id: identity.client_id,
-        local_ipv4,
-        aethernoize: profile.clone(),
-        ports: wireguard::WG_PORTS.to_vec(),
-        ip: prober::IpScan::parse(&cfg.ip_mode),
-    };
+    let mut profile_name = cfg.noize_profile.clone();
+    let mut profile = aethernoize::from_profile(&profile_name);
     let scan_mode = wg_prober::WgScanMode::parse(&cfg.scan_mode);
     let mut last_good_peer: Option<SocketAddr> = None;
 
@@ -425,11 +432,43 @@ async fn run_wireguard(
             Some(peer) => peer,
             None => {
                 log::info!("scanning for a working WireGuard endpoint");
-                let found = tokio::select! {
-                    value = wg_prober::hunt_best_wg_endpoint(&probe, scan_mode) => value?,
-                    _ = &mut *stop => return Ok(()),
-                };
-                SocketAddr::new(found.ip, found.port)
+                let mut selected = None;
+                let mut last_error = None;
+                for candidate_name in profile_candidates(&profile_name, true) {
+                    let candidate_profile = aethernoize::from_profile(&candidate_name);
+                    let probe = wg_prober::WgProbe {
+                        private_key: Arc::new(private_key),
+                        peer_public_key: Arc::new(public_key),
+                        client_id: identity.client_id,
+                        local_ipv4,
+                        aethernoize: candidate_profile.clone(),
+                        ports: wireguard::WG_PORTS.to_vec(),
+                        ip: prober::IpScan::parse(&cfg.ip_mode),
+                    };
+                    log::info!("testing WireGuard noize profile '{candidate_name}'");
+                    let found = tokio::select! {
+                        value = wg_prober::hunt_best_wg_endpoint(&probe, scan_mode) => value,
+                        _ = &mut *stop => return Ok(()),
+                    };
+                    match found {
+                        Ok(found) => {
+                            profile_name = candidate_name;
+                            profile = candidate_profile;
+                            selected = Some(SocketAddr::new(found.ip, found.port));
+                            break;
+                        }
+                        Err(error) => {
+                            log::warn!("WireGuard profile '{candidate_name}' failed: {error}");
+                            last_error = Some(error.to_string());
+                        }
+                    }
+                }
+                selected.ok_or_else(|| {
+                    AetherError::Other(format!(
+                        "all WireGuard profiles failed: {}",
+                        last_error.unwrap_or_else(|| "no endpoint".to_string())
+                    ))
+                })?
             }
         };
         log::info!("using WireGuard endpoint {peer}");
@@ -464,7 +503,7 @@ async fn run_wireguard(
                 continue;
             }
         };
-        log::info!("WireGuard data plane is ready");
+        log::info!("WireGuard data plane is ready; working noize profile: {profile_name}");
 
         match bridge_and_run(
             tun.clone(),
@@ -505,19 +544,12 @@ async fn run_masque(
         .parse()
         .map_err(|_| AetherError::Other("invalid identity IPv4".into()))?;
     log::info!("WARP identity ready with tunnel IPv4 {local_ipv4}");
-    let noise = noize::from_profile(&cfg.noize_profile);
-    let probe = prober::MasqueProbe {
-        sni: consts::CONNECT_SNI.to_string(),
-        authority: quic::default_authority().to_string(),
-        path: quic::default_path().to_string(),
-        cert_pem: Arc::from(identity.cert_pem.clone()),
-        key_pem: Arc::from(identity.key_pem.clone()),
-        ech_config_list: None,
-        noize: noise.clone(),
-        ports: prober::MASQUE_PORTS.to_vec(),
-        ip: prober::IpScan::parse(&cfg.ip_mode),
-        local_ipv4,
+    let mut profile_name = if cfg.noize_profile == "balanced" {
+        "firewall".to_string()
+    } else {
+        cfg.noize_profile.clone()
     };
+    let mut noise = noize::from_profile(&profile_name);
     let h2_enabled = cfg.protocol.eq_ignore_ascii_case("masque-h2");
     let scan_mode = prober::ScanMode::parse(&cfg.scan_mode);
     let mut last_good_peer: Option<SocketAddr> = None;
@@ -556,11 +588,46 @@ async fn run_masque(
             Some(peer) => peer,
             None => {
                 log::info!("scanning for a working MASQUE endpoint");
-                let found = tokio::select! {
-                    value = prober::hunt_best_gateway(&probe, scan_mode) => value?,
-                    _ = &mut *stop => return Ok(()),
-                };
-                SocketAddr::new(found.ip, found.port)
+                let mut selected = None;
+                let mut last_error = None;
+                for candidate_name in profile_candidates(&profile_name, false) {
+                    let candidate_noise = noize::from_profile(&candidate_name);
+                    let probe = prober::MasqueProbe {
+                        sni: consts::CONNECT_SNI.to_string(),
+                        authority: quic::default_authority().to_string(),
+                        path: quic::default_path().to_string(),
+                        cert_pem: Arc::from(identity.cert_pem.clone()),
+                        key_pem: Arc::from(identity.key_pem.clone()),
+                        ech_config_list: None,
+                        noize: candidate_noise.clone(),
+                        ports: prober::MASQUE_PORTS.to_vec(),
+                        ip: prober::IpScan::parse(&cfg.ip_mode),
+                        local_ipv4,
+                    };
+                    log::info!("testing MASQUE noize profile '{candidate_name}'");
+                    let found = tokio::select! {
+                        value = prober::hunt_best_gateway(&probe, scan_mode) => value,
+                        _ = &mut *stop => return Ok(()),
+                    };
+                    match found {
+                        Ok(found) => {
+                            profile_name = candidate_name;
+                            noise = candidate_noise;
+                            selected = Some(SocketAddr::new(found.ip, found.port));
+                            break;
+                        }
+                        Err(error) => {
+                            log::warn!("MASQUE profile '{candidate_name}' failed: {error}");
+                            last_error = Some(error.to_string());
+                        }
+                    }
+                }
+                selected.ok_or_else(|| {
+                    AetherError::Other(format!(
+                        "all MASQUE profiles failed: {}",
+                        last_error.unwrap_or_else(|| "no endpoint".to_string())
+                    ))
+                })?
             }
         };
         log::info!("using MASQUE endpoint {peer}");
@@ -613,7 +680,7 @@ async fn run_masque(
             }
             continue;
         }
-        log::info!("MASQUE data plane is ready");
+        log::info!("MASQUE data plane is ready; working noize profile: {profile_name}");
 
         match bridge_and_run(
             tun.clone(),

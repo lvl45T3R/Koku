@@ -8,6 +8,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import io.github.lvl45t3r.koku.AetherNative
@@ -19,38 +21,81 @@ import io.github.lvl45t3r.koku.TunnelState
 class AetherVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var nativeHandle: Long = 0
+    @Volatile private var startupGeneration: Long = 0
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
+                startupGeneration++
                 AetherNative.log("INFO", "Stop requested")
                 AetherNative.markStopping()
                 stopTunnel()
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_START -> runCatching {
-                startTunnel(
-                    intent.getStringExtra(EXTRA_PROTOCOL) ?: "masque-h3",
-                    intent.getStringExtra(EXTRA_SCAN_MODE) ?: "turbo",
-                    intent.getStringExtra(EXTRA_PER_APP_MODE) ?: PerAppProxyMode.ALL.wireName,
-                    intent.getStringArrayListExtra(EXTRA_PER_APP_PACKAGES)?.toSet() ?: emptySet(),
-                )
-            }.onFailure { error ->
-                AetherNative.log(
-                    "ERROR",
-                    "VPN startup failed: ${error.message ?: error.javaClass.simpleName}",
-                )
-                stopTunnel()
-                stopSelf()
-            }
+            ACTION_START -> prepareTunnelStart(intent)
         }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        startupGeneration++
         stopTunnel()
         super.onDestroy()
+    }
+
+    private fun prepareTunnelStart(intent: Intent) {
+        if (tun != null) {
+            AetherNative.log("WARN", "VPN is already running")
+            return
+        }
+
+        if (AetherNative.tunnelState.value != TunnelState.STARTING) {
+            AetherNative.markStarting()
+        }
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, notification())
+
+        val protocol = intent.getStringExtra(EXTRA_PROTOCOL) ?: "masque-h3"
+        val scanMode = intent.getStringExtra(EXTRA_SCAN_MODE) ?: "turbo"
+        val perAppMode = intent.getStringExtra(EXTRA_PER_APP_MODE)
+            ?: PerAppProxyMode.ALL.wireName
+        val perAppPackages = intent.getStringArrayListExtra(EXTRA_PER_APP_PACKAGES)
+            ?.toSet()
+            ?: emptySet()
+        val generation = ++startupGeneration
+
+        Thread({
+            val networkKey = NetworkProfileCache.resolveNetworkKey(this)
+            val profile = NetworkProfileCache.load(this, networkKey, protocol)
+            AetherNative.log(
+                "INFO",
+                "Network profile scope: $networkKey; trying '$profile' first",
+            )
+            Handler(Looper.getMainLooper()).post {
+                if (generation != startupGeneration) return@post
+                runCatching {
+                    startTunnel(
+                        protocol,
+                        scanMode,
+                        perAppMode,
+                        perAppPackages,
+                        networkKey,
+                        profile,
+                    )
+                }.onFailure { error ->
+                    AetherNative.log(
+                        "ERROR",
+                        "VPN startup failed: ${error.message ?: error.javaClass.simpleName}",
+                    )
+                    stopTunnel()
+                    stopSelf()
+                }
+            }
+        }, "koku-network-profile").apply {
+            isDaemon = true
+            start()
+        }
     }
 
     private fun startTunnel(
@@ -58,6 +103,8 @@ class AetherVpnService : VpnService() {
         scanMode: String,
         perAppMode: String,
         perAppPackages: Set<String>,
+        networkKey: String,
+        noizeProfile: String,
     ) {
         if (AetherNative.tunnelState.value != TunnelState.STARTING) {
             AetherNative.markStarting()
@@ -105,9 +152,12 @@ class AetherVpnService : VpnService() {
         nativeHandle = AetherNative.start(
             protocol,
             scanMode,
+            noizeProfile,
             filesDir.absolutePath,
             descriptor,
-        )
+        ) { workingProfile ->
+            NetworkProfileCache.save(this, networkKey, protocol, workingProfile)
+        }
         if (nativeHandle == 0L) {
             AetherNative.log("ERROR", "Native engine rejected startup")
             stopTunnel()

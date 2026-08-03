@@ -15,8 +15,12 @@ both vendored under `engine/`.
 
 The vendored snapshot is intentionally stored without upstream Git metadata.
 `engine/REVISION` records the upstream Aether release and commit used by the
-Android build. The current transport port is based on Aether `v1.4.0` at
-`ee5a5f5`.
+Android build. The current transport port is based on Aether `v1.5.0` at
+`66a798b`. It selectively carries the transport, probe, and resolver fixes
+used by the Android adapter; the upstream CLI-only API front, routing-rule
+menu, and Zero Trust enrolment flow are intentionally not exposed here.
+The upstream quiche 0.29.3 vendor refresh is also deferred until the Android
+Rust/NDK toolchain can compile and exercise that much larger dependency bump.
 
 ## Reused source
 
@@ -24,8 +28,10 @@ Android build. The current transport port is based on Aether `v1.4.0` at
 `engine/aether/src`. This covers endpoint discovery, account provisioning,
 MASQUE, HTTP/2, WireGuard, TLS, fragmentation, and obfuscation behavior.
 It also includes Aether's Ironclad tunnel probe, MASQUE SPKI certificate
-pinning, reconnect task cleanup, WireGuard dead-tunnel detection, and adaptive
-runtime tuning from Aether v1.4.
+pinning, reconnect task cleanup, WireGuard dead-tunnel detection, adaptive
+runtime tuning, netstack backpressure fixes, authenticated DNS replies,
+source-locked SOCKS UDP associations, and the corrected v1.5 endpoint scan
+order.
 
 `native/Cargo.toml` resolves the local transport dependencies from the same
 repository:

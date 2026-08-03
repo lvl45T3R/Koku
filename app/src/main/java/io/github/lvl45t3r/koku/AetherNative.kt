@@ -15,6 +15,7 @@ object AetherNative {
     private val trafficPattern = Regex(
         """traffic: TUN -> tunnel (\d+) packets / (\d+) bytes; tunnel -> TUN (\d+) packets / (\d+) bytes"""
     )
+    private val workingProfilePattern = Regex("""working noize profile: ([a-z]+)""")
     private val mutableLogs = MutableStateFlow<List<String>>(emptyList())
     private val mutableTunnelState = MutableStateFlow(TunnelState.IDLE)
     private val mutableTraffic = MutableStateFlow(TrafficSnapshot())
@@ -22,6 +23,7 @@ object AetherNative {
     private val mutableDiagnosticsEnabled = MutableStateFlow(false)
     private val logSink = NativeLogSink(::appendLog)
     private var testBaseline = TrafficSnapshot()
+    @Volatile private var workingProfileReceiver: ((String) -> Unit)? = null
 
     val logs: StateFlow<List<String>> = mutableLogs.asStateFlow()
     val tunnelState: StateFlow<TunnelState> = mutableTunnelState.asStateFlow()
@@ -95,18 +97,24 @@ object AetherNative {
     fun start(
         protocol: String,
         scanMode: String,
+        noizeProfile: String,
         configDir: String,
         tun: ParcelFileDescriptor,
+        onWorkingProfile: (String) -> Unit,
     ): Long {
         check(loaded) { "Native Aether library is unavailable." }
         val configJson = JSONObject()
             .put("protocol", protocol)
             .put("scanMode", scanMode)
             .put("ipMode", "v4")
-            .put("noizeProfile", "balanced")
+            .put("noizeProfile", noizeProfile)
             .put("configDir", configDir)
             .toString()
-        appendLog("INFO", "Starting native engine: protocol=$protocol, scan=$scanMode")
+        workingProfileReceiver = onWorkingProfile
+        appendLog(
+            "INFO",
+            "Starting native engine: protocol=$protocol, scan=$scanMode, profile=$noizeProfile",
+        )
         return nativeStart(configJson, tun.detachFd(), logSink)
     }
 
@@ -115,6 +123,7 @@ object AetherNative {
             appendLog("INFO", "Stopping native engine")
             nativeStop(handle)
         }
+        workingProfileReceiver = null
     }
 
     fun log(level: String, message: String) {
@@ -152,6 +161,10 @@ object AetherNative {
             mutableTunnelState.value = TunnelState.CONNECTED
         } else if (level.equals("ERROR", ignoreCase = true) && tunnelIsActive()) {
             mutableTunnelState.value = TunnelState.FAILED
+        }
+
+        workingProfilePattern.find(message)?.groupValues?.getOrNull(1)?.let { profile ->
+            workingProfileReceiver?.invoke(profile)
         }
 
         trafficPattern.find(message)?.destructured?.let {
