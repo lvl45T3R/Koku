@@ -2,6 +2,18 @@
 
 All notable user-facing changes are recorded here. Per-release APK hashes and verification evidence live under `releases/`.
 
+## [0.3.7] - 2026-08-17
+
+### Added
+
+- Added the opt-in DNS Hunter fallback. Koku validates the default resolver first and, only when that fails, tests a bounded set of public resolvers and applies the fastest clean result to Android VPN DNS.
+- Added in-app attribution for the DNS Hunter method from mirarr-app/network-checker, including the upstream revision, unmodified GPL-3.0 text, source link, and third-party notice.
+
+### Notes
+
+- DNS changes hostname resolution only; they cannot make a literal, blocked IP reachable or replace Koku's WARP gateway IP scan.
+- Release version is now `versionCode 10` / `versionName 0.3.7`.
+
 ## [0.3.6] - 2026-08-16
 
 ### Added

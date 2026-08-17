@@ -17,3 +17,8 @@ quiche is Copyright Cloudflare, Inc. and is distributed under the
 BSD-2-Clause license found at `engine/quiche/COPYING`.
 
 See [PROVENANCE.md](PROVENANCE.md) for the exact integration boundary.
+
+DNS Hunter support adapts the DNS Hunter method from network-checker by
+mirarr-app and contributors. It is GPL-3.0 licensed; attribution, source
+revision, and integration notes are retained in
+[`third_party/network-checker/UPSTREAM.md`](third_party/network-checker/UPSTREAM.md).

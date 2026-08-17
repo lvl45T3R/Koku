@@ -155,6 +155,7 @@ private fun AetherScreen() {
     var protocol by remember { mutableStateOf("masque-h3") }
     var scanMode by remember { mutableStateOf("turbo") }
     var noIrExit by remember { mutableStateOf(loadNoIrExit(context)) }
+    var dnsHunter by remember { mutableStateOf(loadDnsHunter(context)) }
     var perAppProxyMode by remember { mutableStateOf(loadPerAppProxyMode(context)) }
     var proxyPackages by remember { mutableStateOf(loadPerAppProxyPackages(context)) }
     val logs by AetherNative.logs.collectAsState()
@@ -177,6 +178,7 @@ private fun AetherScreen() {
                 protocol,
                 scanMode,
                 noIrExit,
+                dnsHunter,
                 perAppProxyMode,
                 proxyPackages,
             )
@@ -206,6 +208,7 @@ private fun AetherScreen() {
                 protocol,
                 scanMode,
                 noIrExit,
+                dnsHunter,
                 perAppProxyMode,
                 proxyPackages,
             )
@@ -299,6 +302,7 @@ private fun AetherScreen() {
                     protocol = protocol,
                     scanMode = scanMode,
                     noIrExit = noIrExit,
+                    dnsHunter = dnsHunter,
                     perAppProxyMode = perAppProxyMode,
                     selectedPackages = proxyPackages,
                     protocolEnabled = startEnabled,
@@ -307,6 +311,10 @@ private fun AetherScreen() {
                     onNoIrExitChange = {
                         noIrExit = it
                         saveNoIrExit(context, it)
+                    },
+                    onDnsHunterChange = {
+                        dnsHunter = it
+                        saveDnsHunter(context, it)
                     },
                     onPerAppModeChange = {
                         perAppProxyMode = it
@@ -789,12 +797,14 @@ private fun SettingsScreen(
     protocol: String,
     scanMode: String,
     noIrExit: Boolean,
+    dnsHunter: Boolean,
     perAppProxyMode: PerAppProxyMode,
     selectedPackages: Set<String>,
     protocolEnabled: Boolean,
     onProtocolChange: (String) -> Unit,
     onScanModeChange: (String) -> Unit,
     onNoIrExitChange: (Boolean) -> Unit,
+    onDnsHunterChange: (Boolean) -> Unit,
     onPerAppModeChange: (PerAppProxyMode) -> Unit,
     onPackageToggle: (String) -> Unit,
 ) {
@@ -891,6 +901,47 @@ private fun SettingsScreen(
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
+                }
+            }
+        }
+
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text("DNS Hunter fallback", fontWeight = FontWeight.Bold)
+                    ProtocolOption(
+                        label = "Enabled",
+                        detail = "Use a clean DNS fallback if the default resolver fails",
+                        value = "enabled",
+                        selected = if (dnsHunter) "enabled" else "disabled",
+                        enabled = protocolEnabled,
+                        onSelect = { onDnsHunterChange(true) },
+                    )
+                    ProtocolOption(
+                        label = "Disabled",
+                        detail = "Always use the default Cloudflare resolver",
+                        value = "disabled",
+                        selected = if (dnsHunter) "enabled" else "disabled",
+                        enabled = protocolEnabled,
+                        onSelect = { onDnsHunterChange(false) },
+                    )
+                    Text(
+                        "Tests the default resolver first, then a small DNS Hunter fallback set. It affects hostname DNS inside the VPN; it cannot unblock a literal IP or replace the WARP gateway scan.",
+                        color = Muted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Text(
+                        "DNS Hunter method: mirarr-app/network-checker (GPL-3.0)\nhttps://github.com/mirarr-app/network-checker",
+                        color = Muted,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
             }
         }
@@ -1384,6 +1435,7 @@ private fun testButtonLabel(state: ConnectionTestState): String = when (state) {
 
 private const val SETTINGS_PREFS = "koku_settings"
 private const val PREF_NO_IR_EXIT = "no_ir_exit"
+private const val PREF_DNS_HUNTER = "dns_hunter"
 private const val PREF_PER_APP_PROXY_MODE = "per_app_proxy_mode"
 private const val PREF_PER_APP_PROXY_PACKAGES = "per_app_proxy_packages"
 
@@ -1396,6 +1448,18 @@ private fun saveNoIrExit(context: Context, enabled: Boolean) {
     context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
         .edit()
         .putBoolean(PREF_NO_IR_EXIT, enabled)
+        .apply()
+}
+
+private fun loadDnsHunter(context: Context): Boolean {
+    return context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
+        .getBoolean(PREF_DNS_HUNTER, false)
+}
+
+private fun saveDnsHunter(context: Context, enabled: Boolean) {
+    context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putBoolean(PREF_DNS_HUNTER, enabled)
         .apply()
 }
 
