@@ -1,0 +1,24 @@
+.gradle/
+.kotlin/
+local.properties
+build/
+**/build/
+**/target/
+signing/
+captures/
+.externalNativeBuild/
+.cxx/
+*.iml
+.idea/
+.tooling/
+
+# Native release outputs
+app/src/main/jniLibs/
+
+# Secrets and private tunnel identities
+*.toml
+*.pem
+*.key
+
+!native/Cargo.toml
+!engine/**/*.toml
