@@ -112,7 +112,7 @@ struct AndroidConfig {
 }
 
 fn default_protocol() -> String {
-    "masque-h3".into()
+    "masque-h2".into()
 }
 
 fn is_h2_protocol(protocol: &str) -> bool {

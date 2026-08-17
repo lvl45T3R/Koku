@@ -24,8 +24,8 @@ android {
         applicationId = "io.github.lvl45t3r.koku"
         minSdk = 24
         targetSdk = 35
-        versionCode = 11
-        versionName = "0.3.8"
+        versionCode = 12
+        versionName = "0.3.9"
 
         ndk {
             abiFilters += requestedAbis

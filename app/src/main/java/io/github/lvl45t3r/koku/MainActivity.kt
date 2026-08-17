@@ -153,7 +153,7 @@ private data class AppProxyEntry(
 private fun AetherScreen() {
     val context = LocalContext.current
     var selectedTab by remember { mutableStateOf(AppTab.HOME) }
-    var protocol by remember { mutableStateOf("masque-h3") }
+    var protocol by remember { mutableStateOf("masque-h2") }
     var scanMode by remember { mutableStateOf("turbo") }
     var noIrExit by remember { mutableStateOf(loadNoIrExit(context)) }
     var dnsStormMode by remember { mutableStateOf(loadDnsStormMode(context)) }
@@ -1341,11 +1341,24 @@ private fun ProtocolOption(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(vertical = 4.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(label, fontWeight = FontWeight.Bold)
-                Text(detail, color = if (selected == value) Color.White else Muted, fontSize = 11.sp)
+                Text(
+                    text = label,
+                    modifier = Modifier.weight(0.38f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    text = detail,
+                    modifier = Modifier.weight(0.62f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = if (selected == value) Color.White else Muted,
+                    fontSize = 11.sp,
+                    textAlign = TextAlign.End,
+                )
             }
         },
         modifier = Modifier.fillMaxWidth(),

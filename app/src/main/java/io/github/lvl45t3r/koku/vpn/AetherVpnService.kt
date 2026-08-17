@@ -58,7 +58,7 @@ class AetherVpnService : VpnService() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, notification())
 
-        val protocol = intent.getStringExtra(EXTRA_PROTOCOL) ?: "masque-h3"
+        val protocol = intent.getStringExtra(EXTRA_PROTOCOL) ?: "masque-h2"
         val scanMode = intent.getStringExtra(EXTRA_SCAN_MODE) ?: "turbo"
         val noIrExit = intent.getBooleanExtra(EXTRA_NO_IR_EXIT, false)
         val dnsStormMode = intent.getStringExtra(EXTRA_DNS_STORM_MODE) ?: "default"
