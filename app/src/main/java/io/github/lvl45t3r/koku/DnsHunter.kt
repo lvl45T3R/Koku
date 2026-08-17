@@ -1,9 +1,12 @@
 package io.github.lvl45t3r.koku
 
+import android.content.Context
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.SocketTimeoutException
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 
 /**
  * Resolver fallback adapted from network-checker's GPL-3.0 DNS Hunter.
@@ -16,6 +19,9 @@ internal object DnsHunter {
     private const val TARGET = "x.com"
     private const val TIMEOUT_MS = 1_500
     private const val TRANSACTION_ID = 0xABCD
+    private const val IRANIAN_RANGE_ASSET = "network_checker_dns_ranges.dart"
+    private const val MAX_IRANIAN_PROBES = 128
+    private const val MAX_CONCURRENT_PROBES = 16
 
     // Small, auditable seed list. Unlike the upstream UI scanner, Koku never sweeps
     // arbitrary CIDRs during VPN startup.
@@ -27,17 +33,40 @@ internal object DnsHunter {
         "149.112.112.112",
     )
 
-    data class Selection(val resolver: String, val usedFallback: Boolean)
+    enum class Mode(val wireName: String) {
+        DEFAULT("default"),
+        PUBLIC_FALLBACK("public"),
+        IRANIAN_HUNTER("iran"),
+        CUSTOM("custom");
+
+        companion object {
+            fun fromWireName(value: String) = entries.firstOrNull { it.wireName == value } ?: DEFAULT
+        }
+    }
+
+    data class Selection(val resolver: String, val source: String)
 
     /**
      * Keep the normal Cloudflare resolver if it gives a clean response. Only hunt
      * the small fallback set when that direct resolver fails validation.
      */
-    fun selectResolver(log: (String, String) -> Unit): Selection {
+    fun selectResolver(
+        context: Context,
+        mode: Mode,
+        customResolvers: String,
+        log: (String, String) -> Unit,
+    ): Selection = when (mode) {
+        Mode.DEFAULT -> Selection(DEFAULT_RESOLVER, "default")
+        Mode.PUBLIC_FALLBACK -> selectPublicFallback(log)
+        Mode.IRANIAN_HUNTER -> selectIranianResolver(context, log)
+        Mode.CUSTOM -> selectCustomResolver(customResolvers, log)
+    }
+
+    private fun selectPublicFallback(log: (String, String) -> Unit): Selection {
         val direct = test(DEFAULT_RESOLVER)
         if (direct != null) {
             log("INFO", "DNS Hunter: default resolver $DEFAULT_RESOLVER passed (${direct.latencyMs} ms)")
-            return Selection(DEFAULT_RESOLVER, usedFallback = false)
+            return Selection(DEFAULT_RESOLVER, "default")
         }
 
         log("WARN", "DNS Hunter: default resolver failed; testing fallback resolvers")
@@ -47,11 +76,95 @@ internal object DnsHunter {
 
         return if (winner == null) {
             log("WARN", "DNS Hunter: no clean fallback resolver; retaining $DEFAULT_RESOLVER")
-            Selection(DEFAULT_RESOLVER, usedFallback = false)
+            Selection(DEFAULT_RESOLVER, "default")
         } else {
             log("INFO", "DNS Hunter: selected ${winner.first} (${winner.second.latencyMs} ms)")
-            Selection(winner.first, usedFallback = true)
+            Selection(winner.first, "public fallback")
         }
+    }
+
+    private fun selectCustomResolver(value: String, log: (String, String) -> Unit): Selection {
+        val candidates = value.split(Regex("[,\\s]+"))
+            .map(String::trim)
+            .filter(::isIpv4)
+            .distinct()
+            .take(MAX_IRANIAN_PROBES)
+        if (candidates.isEmpty()) {
+            log("WARN", "DNS Storming: custom mode has no valid IPv4 resolver; retaining $DEFAULT_RESOLVER")
+            return Selection(DEFAULT_RESOLVER, "default")
+        }
+        return chooseFastest(candidates, "custom", log)
+    }
+
+    private fun selectIranianResolver(context: Context, log: (String, String) -> Unit): Selection {
+        val candidates = runCatching { iranianCandidates(context) }.getOrElse {
+            log("WARN", "DNS Storming: Iranian range list could not be read; ${it.message}")
+            emptyList()
+        }
+        if (candidates.isEmpty()) {
+            log("WARN", "DNS Storming: no Iranian candidates available; retaining $DEFAULT_RESOLVER")
+            return Selection(DEFAULT_RESOLVER, "default")
+        }
+        log("INFO", "DNS Storming: testing ${candidates.size} sampled addresses from Iranian Hunter ranges")
+        return chooseFastest(candidates, "Iranian Hunter", log)
+    }
+
+    private fun chooseFastest(
+        candidates: List<String>,
+        source: String,
+        log: (String, String) -> Unit,
+    ): Selection {
+        val executor = Executors.newFixedThreadPool(MAX_CONCURRENT_PROBES)
+        return try {
+            val winner = executor.invokeAll(candidates.map { resolver ->
+                Callable { test(resolver)?.let { resolver to it } }
+            }).mapNotNull { it.get() }.minByOrNull { (_, result) -> result.latencyMs }
+            if (winner == null) {
+                log("WARN", "DNS Storming: no clean $source resolver found; retaining $DEFAULT_RESOLVER")
+                Selection(DEFAULT_RESOLVER, "default")
+            } else {
+                log("INFO", "DNS Storming: selected ${winner.first} from $source (${winner.second.latencyMs} ms)")
+                Selection(winner.first, source)
+            }
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    /**
+     * The upstream list contains ISP CIDRs, not a claim that every address is a
+     * DNS server. Sample one deterministic usable host per range, capped so a
+     * VPN start remains bounded; manual mode is available for known resolver IPs.
+     */
+    private fun iranianCandidates(context: Context): List<String> {
+        val cidrs = context.assets.open(IRANIAN_RANGE_ASSET).bufferedReader().use { reader ->
+            Regex("\\b(?:\\d{1,3}\\.){3}\\d{1,3}/(?:[0-9]|[12][0-9]|3[0-2])\\b")
+                .findAll(reader.readText())
+                .map { it.value }
+                .toList()
+        }
+        return cidrs.distinct().take(MAX_IRANIAN_PROBES).mapNotNull(::sampleCidr)
+    }
+
+    private fun sampleCidr(cidr: String): String? {
+        val (address, prefixText) = cidr.split('/', limit = 2).let { it[0] to it[1] }
+        val octets = address.split('.').mapNotNull { it.toLongOrNull() }
+        val prefix = prefixText.toIntOrNull() ?: return null
+        if (octets.size != 4 || prefix !in 0..32 || octets.any { it !in 0..255 }) return null
+        val value = octets.fold(0L) { current, octet -> (current shl 8) or octet }
+        val mask = if (prefix == 0) 0L else (0xffffffffL shl (32 - prefix)) and 0xffffffffL
+        val hostCount = 1L shl (32 - prefix)
+        val offset = when {
+            hostCount <= 2L -> 0L
+            else -> 1L + ((value xor prefix.toLong()) % (hostCount - 2L))
+        }
+        val selected = ((value and mask) + offset) and 0xffffffffL
+        return listOf(24, 16, 8, 0).joinToString(".") { shift -> ((selected shr shift) and 0xff).toString() }
+    }
+
+    private fun isIpv4(value: String): Boolean {
+        val parts = value.split('.').mapNotNull { it.toIntOrNull() }
+        return parts.size == 4 && parts.all { it in 0..255 }
     }
 
     private data class Result(val latencyMs: Long)

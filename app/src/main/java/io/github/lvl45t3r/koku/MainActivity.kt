@@ -52,6 +52,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -155,7 +156,8 @@ private fun AetherScreen() {
     var protocol by remember { mutableStateOf("masque-h3") }
     var scanMode by remember { mutableStateOf("turbo") }
     var noIrExit by remember { mutableStateOf(loadNoIrExit(context)) }
-    var dnsHunter by remember { mutableStateOf(loadDnsHunter(context)) }
+    var dnsStormMode by remember { mutableStateOf(loadDnsStormMode(context)) }
+    var dnsStormCustomResolvers by remember { mutableStateOf(loadDnsStormCustomResolvers(context)) }
     var perAppProxyMode by remember { mutableStateOf(loadPerAppProxyMode(context)) }
     var proxyPackages by remember { mutableStateOf(loadPerAppProxyPackages(context)) }
     val logs by AetherNative.logs.collectAsState()
@@ -178,7 +180,8 @@ private fun AetherScreen() {
                 protocol,
                 scanMode,
                 noIrExit,
-                dnsHunter,
+                dnsStormMode,
+                dnsStormCustomResolvers,
                 perAppProxyMode,
                 proxyPackages,
             )
@@ -208,7 +211,8 @@ private fun AetherScreen() {
                 protocol,
                 scanMode,
                 noIrExit,
-                dnsHunter,
+                dnsStormMode,
+                dnsStormCustomResolvers,
                 perAppProxyMode,
                 proxyPackages,
             )
@@ -302,7 +306,8 @@ private fun AetherScreen() {
                     protocol = protocol,
                     scanMode = scanMode,
                     noIrExit = noIrExit,
-                    dnsHunter = dnsHunter,
+                    dnsStormMode = dnsStormMode,
+                    dnsStormCustomResolvers = dnsStormCustomResolvers,
                     perAppProxyMode = perAppProxyMode,
                     selectedPackages = proxyPackages,
                     protocolEnabled = startEnabled,
@@ -312,9 +317,13 @@ private fun AetherScreen() {
                         noIrExit = it
                         saveNoIrExit(context, it)
                     },
-                    onDnsHunterChange = {
-                        dnsHunter = it
-                        saveDnsHunter(context, it)
+                    onDnsStormModeChange = {
+                        dnsStormMode = it
+                        saveDnsStormMode(context, it)
+                    },
+                    onDnsStormCustomResolversChange = {
+                        dnsStormCustomResolvers = it
+                        saveDnsStormCustomResolvers(context, it)
                     },
                     onPerAppModeChange = {
                         perAppProxyMode = it
@@ -797,14 +806,16 @@ private fun SettingsScreen(
     protocol: String,
     scanMode: String,
     noIrExit: Boolean,
-    dnsHunter: Boolean,
+    dnsStormMode: String,
+    dnsStormCustomResolvers: String,
     perAppProxyMode: PerAppProxyMode,
     selectedPackages: Set<String>,
     protocolEnabled: Boolean,
     onProtocolChange: (String) -> Unit,
     onScanModeChange: (String) -> Unit,
     onNoIrExitChange: (Boolean) -> Unit,
-    onDnsHunterChange: (Boolean) -> Unit,
+    onDnsStormModeChange: (String) -> Unit,
+    onDnsStormCustomResolversChange: (String) -> Unit,
     onPerAppModeChange: (PerAppProxyMode) -> Unit,
     onPackageToggle: (String) -> Unit,
 ) {
@@ -915,25 +926,53 @@ private fun SettingsScreen(
                     modifier = Modifier.padding(18.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Text("DNS Hunter fallback", fontWeight = FontWeight.Bold)
+                    Text("DNS Storming", fontWeight = FontWeight.Bold)
                     ProtocolOption(
-                        label = "Enabled",
-                        detail = "Use a clean DNS fallback if the default resolver fails",
-                        value = "enabled",
-                        selected = if (dnsHunter) "enabled" else "disabled",
+                        label = "Default",
+                        detail = "Always use Cloudflare 1.1.1.1",
+                        value = "default",
+                        selected = dnsStormMode,
                         enabled = protocolEnabled,
-                        onSelect = { onDnsHunterChange(true) },
+                        onSelect = onDnsStormModeChange,
                     )
                     ProtocolOption(
-                        label = "Disabled",
-                        detail = "Always use the default Cloudflare resolver",
-                        value = "disabled",
-                        selected = if (dnsHunter) "enabled" else "disabled",
+                        label = "Public Hunter",
+                        detail = "Try public fallbacks only if 1.1.1.1 fails",
+                        value = "public",
+                        selected = dnsStormMode,
                         enabled = protocolEnabled,
-                        onSelect = { onDnsHunterChange(false) },
+                        onSelect = onDnsStormModeChange,
                     )
+                    ProtocolOption(
+                        label = "Iranian Hunter",
+                        detail = "Sample the bundled Iranian ISP ranges and select a clean DNS",
+                        value = "iran",
+                        selected = dnsStormMode,
+                        enabled = protocolEnabled,
+                        onSelect = onDnsStormModeChange,
+                    )
+                    ProtocolOption(
+                        label = "Custom DNS",
+                        detail = "Test and select from the resolver IPs you provide",
+                        value = "custom",
+                        selected = dnsStormMode,
+                        enabled = protocolEnabled,
+                        onSelect = onDnsStormModeChange,
+                    )
+                    if (dnsStormMode == "custom") {
+                        OutlinedTextField(
+                            value = dnsStormCustomResolvers,
+                            onValueChange = onDnsStormCustomResolversChange,
+                            enabled = protocolEnabled,
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("Custom resolver IPs") },
+                            placeholder = { Text("10.202.10.10, 1.1.1.1") },
+                            supportingText = { Text("IPv4 only; separate entries with commas, spaces, or new lines.") },
+                            minLines = 2,
+                        )
+                    }
                     Text(
-                        "Tests the default resolver first, then a small DNS Hunter fallback set. It affects hostname DNS inside the VPN; it cannot unblock a literal IP or replace the WARP gateway scan.",
+                        "Iranian Hunter uses the bundled network-checker Iranian ISP CIDR data, samples up to 128 addresses, and only accepts a resolver after a valid DNS response. It affects hostname DNS inside the VPN; it cannot unblock a literal IP or replace the WARP gateway scan.",
                         color = Muted,
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -1435,7 +1474,8 @@ private fun testButtonLabel(state: ConnectionTestState): String = when (state) {
 
 private const val SETTINGS_PREFS = "koku_settings"
 private const val PREF_NO_IR_EXIT = "no_ir_exit"
-private const val PREF_DNS_HUNTER = "dns_hunter"
+private const val PREF_DNS_STORM_MODE = "dns_storm_mode"
+private const val PREF_DNS_STORM_CUSTOM_RESOLVERS = "dns_storm_custom_resolvers"
 private const val PREF_PER_APP_PROXY_MODE = "per_app_proxy_mode"
 private const val PREF_PER_APP_PROXY_PACKAGES = "per_app_proxy_packages"
 
@@ -1451,15 +1491,29 @@ private fun saveNoIrExit(context: Context, enabled: Boolean) {
         .apply()
 }
 
-private fun loadDnsHunter(context: Context): Boolean {
+private fun loadDnsStormMode(context: Context): String {
     return context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
-        .getBoolean(PREF_DNS_HUNTER, false)
+        .getString(PREF_DNS_STORM_MODE, "default")
+        ?: "default"
 }
 
-private fun saveDnsHunter(context: Context, enabled: Boolean) {
+private fun saveDnsStormMode(context: Context, mode: String) {
     context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
         .edit()
-        .putBoolean(PREF_DNS_HUNTER, enabled)
+        .putString(PREF_DNS_STORM_MODE, mode)
+        .apply()
+}
+
+private fun loadDnsStormCustomResolvers(context: Context): String {
+    return context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
+        .getString(PREF_DNS_STORM_CUSTOM_RESOLVERS, "")
+        ?: ""
+}
+
+private fun saveDnsStormCustomResolvers(context: Context, resolvers: String) {
+    context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(PREF_DNS_STORM_CUSTOM_RESOLVERS, resolvers)
         .apply()
 }
 

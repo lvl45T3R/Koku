@@ -61,7 +61,8 @@ class AetherVpnService : VpnService() {
         val protocol = intent.getStringExtra(EXTRA_PROTOCOL) ?: "masque-h3"
         val scanMode = intent.getStringExtra(EXTRA_SCAN_MODE) ?: "turbo"
         val noIrExit = intent.getBooleanExtra(EXTRA_NO_IR_EXIT, false)
-        val dnsHunter = intent.getBooleanExtra(EXTRA_DNS_HUNTER, false)
+        val dnsStormMode = intent.getStringExtra(EXTRA_DNS_STORM_MODE) ?: "default"
+        val dnsStormCustomResolvers = intent.getStringExtra(EXTRA_DNS_STORM_CUSTOM_RESOLVERS).orEmpty()
         val perAppMode = intent.getStringExtra(EXTRA_PER_APP_MODE)
             ?: PerAppProxyMode.ALL.wireName
         val perAppPackages = intent.getStringArrayListExtra(EXTRA_PER_APP_PACKAGES)
@@ -72,11 +73,13 @@ class AetherVpnService : VpnService() {
         Thread({
             val networkKey = NetworkProfileCache.resolveNetworkKey(this)
             val profile = NetworkProfileCache.load(this, networkKey, protocol)
-            val dnsServer = if (dnsHunter) {
-                DnsHunter.selectResolver(AetherNative::log).resolver
-            } else {
-                "1.1.1.1"
-            }
+            val dnsSelection = DnsHunter.selectResolver(
+                this,
+                DnsHunter.Mode.fromWireName(dnsStormMode),
+                dnsStormCustomResolvers,
+                AetherNative::log,
+            )
+            val dnsServer = dnsSelection.resolver
             AetherNative.log(
                 "INFO",
                 "Network profile scope: $networkKey; trying '$profile' first",
@@ -89,6 +92,7 @@ class AetherVpnService : VpnService() {
                         scanMode,
                         noIrExit,
                         dnsServer,
+                        dnsSelection.source,
                         perAppMode,
                         perAppPackages,
                         networkKey,
@@ -114,6 +118,7 @@ class AetherVpnService : VpnService() {
         scanMode: String,
         noIrExit: Boolean,
         dnsServer: String,
+        dnsSource: String,
         perAppMode: String,
         perAppPackages: Set<String>,
         networkKey: String,
@@ -157,7 +162,7 @@ class AetherVpnService : VpnService() {
 
         tun = descriptor
         AetherNative.log("INFO", "TUN established; handing fd to vendored Aether engine")
-        AetherNative.log("INFO", "VPN DNS resolver: $dnsServer")
+        AetherNative.log("INFO", "VPN DNS resolver: $dnsServer ($dnsSource)")
         AetherNative.log(
             "INFO",
             "Aether itself bypasses the VPN to prevent a routing loop; generate test traffic in another app",
@@ -296,7 +301,8 @@ class AetherVpnService : VpnService() {
         private const val EXTRA_PROTOCOL = "protocol"
         private const val EXTRA_SCAN_MODE = "scanMode"
         private const val EXTRA_NO_IR_EXIT = "noIrExit"
-        private const val EXTRA_DNS_HUNTER = "dnsHunter"
+        private const val EXTRA_DNS_STORM_MODE = "dnsStormMode"
+        private const val EXTRA_DNS_STORM_CUSTOM_RESOLVERS = "dnsStormCustomResolvers"
         private const val EXTRA_PER_APP_MODE = "perAppMode"
         private const val EXTRA_PER_APP_PACKAGES = "perAppPackages"
         private const val CHANNEL_ID = "aether_vpn"
@@ -307,7 +313,8 @@ class AetherVpnService : VpnService() {
             protocol: String,
             scanMode: String,
             noIrExit: Boolean,
-            dnsHunter: Boolean,
+            dnsStormMode: String,
+            dnsStormCustomResolvers: String,
             perAppMode: PerAppProxyMode,
             perAppPackages: Set<String>,
         ) {
@@ -316,7 +323,8 @@ class AetherVpnService : VpnService() {
                 .putExtra(EXTRA_PROTOCOL, protocol)
                 .putExtra(EXTRA_SCAN_MODE, scanMode)
                 .putExtra(EXTRA_NO_IR_EXIT, noIrExit)
-                .putExtra(EXTRA_DNS_HUNTER, dnsHunter)
+                .putExtra(EXTRA_DNS_STORM_MODE, dnsStormMode)
+                .putExtra(EXTRA_DNS_STORM_CUSTOM_RESOLVERS, dnsStormCustomResolvers)
                 .putExtra(EXTRA_PER_APP_MODE, perAppMode.wireName)
                 .putStringArrayListExtra(
                     EXTRA_PER_APP_PACKAGES,

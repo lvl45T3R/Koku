@@ -2,6 +2,19 @@
 
 All notable user-facing changes are recorded here. Per-release APK hashes and verification evidence live under `releases/`.
 
+## [0.3.8] - 2026-08-17
+
+### Added
+
+- Replaced the binary DNS Hunter switch with **DNS Storming**: Default, Public Hunter, Iranian Hunter, and Custom DNS modes.
+- Added the unmodified Iranian ISP CIDR source from network-checker. Iranian Hunter samples a bounded set of addresses and accepts only resolvers that answer a validated DNS query.
+- Added Custom DNS input for one or more manually supplied IPv4 resolver addresses.
+
+### Notes
+
+- Iranian CIDRs are scan targets, not an assertion that every address is a DNS resolver. The scan is limited to 128 sampled addresses to keep VPN startup bounded.
+- Release version is now `versionCode 11` / `versionName 0.3.8`.
+
 ## [0.3.7] - 2026-08-17
 
 ### Added
