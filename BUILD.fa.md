@@ -11,7 +11,7 @@
 - Android SDK Platform 35
 - Android Build Tools
 - Android NDK r26b یا نسخه سازگار
-- Rust 1.88 یا جدیدتر
+- Rust 1.98 یا جدیدتر
 - `cargo-ndk`
 
 سورس‌های لازم موتور در پوشهٔ `engine` همین مخزن قرار دارند. پروژه از یک
@@ -21,6 +21,8 @@
 
 ```bash
 export ANDROID_NDK_HOME=/path/to/android-ndk-r26b
+export CXXSTDLIB=c++_static
+export BORING_BSSL_RUST_CPPLIB=c++_static
 cd native
 cargo ndk -t arm64-v8a -P 24 -o ../app/src/main/jniLibs build --release
 ```

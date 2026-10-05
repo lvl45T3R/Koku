@@ -3,11 +3,11 @@
 This directory contains the source required to reproduce Koku's native Android
 library.
 
-- `aether/` contains the Aether transport modules used by the JNI adapter.
+- `aether/` contains the complete Aether 2.3.0 core used by the JNI adapter.
 - `quiche/` contains the `quiche`, `octets`, and `qlog` workspace members used
   by that transport layer.
-- `REVISION` is a SHA-256 content fingerprint of the vendored files.
+- `REVISION` identifies the pinned upstream commit and Android port.
 
-The snapshot contains no Git metadata. Unrelated applications, examples, test
-certificates, fuzzing inputs, and tools are excluded. Original license and
-copyright files remain alongside the corresponding source.
+The snapshot contains no Git metadata. Original license and copyright files
+remain alongside the corresponding source. See PROVENANCE.md for embedding
+patches and FEATURE_PARITY.md for Android behavior.

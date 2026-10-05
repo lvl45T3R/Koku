@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use boring::pkey::PKey;
-use boring::ssl::{SslConnector, SslMethod, SslVersion};
+use boring::ssl::{SslConnector, SslMethod};
 use boring::x509::X509;
 use bytes::Bytes;
 use http::Method;
@@ -18,15 +18,63 @@ use crate::masque::{self, Capsule, CapsuleParser};
 use crate::quic::{AssignedAddr, Control, Internals};
 use crate::tls;
 
-const H2_ALPN: &[u8] = b"\x02h2";
-const CHROME_GROUPS: &str = "P-256:X25519:P-384";
+/// ALPN: HTTP/2, then HTTP/1.1, as Chrome offers them; the edge picks HTTP/2, which the
+/// tunnel speaks.
+const H2_ALPN: &[u8] = b"\x02h2\x08http/1.1";
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+/// The largest DATA frame we let the edge send us. The h2 default is the RFC
+/// minimum of 16 KiB, so a fast stream pays four times the frame headers and
+/// four times the wakeups it needs to.
+const H2_MAX_FRAME_SIZE: u32 = 64 * 1024;
+
+/// How much a single write to the edge may carry. Every capsule sent on its own
+/// costs a DATA frame, a TLS record and a TCP segment, which for a 1280-byte
+/// packet is mostly overhead, so packets already queued behind one another are
+/// gathered up to this much and sent together.
+const H2_SEND_BATCH_BYTES: usize = 32 * 1024;
+
+/// How long the tunnel waits, on a clean shutdown, for the send task to put the
+/// closing frame on the wire.
+const SENDER_CLOSE_GRACE: Duration = Duration::from_millis(250);
+
+/// Whether a handshake that failed with `message` was turned down for its
+/// ECHConfigList, which BoringSSL reports as ECH_REJECTED once the handshake that
+/// turned it down is over. Only then does it hand out the retry configs the server
+/// sent, if any; asked after any other failure, it hands out a placeholder.
+fn rejected_ech(message: &str) -> bool {
+    message.contains("ECH_REJECTED")
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// Everything the send task accepts besides the packets on the outbound queue.
+enum SenderMsg {
+    /// A capsule that is already framed, used by the data-plane probes.
+    Capsule(Bytes),
+    /// End the request stream and stop.
+    Finish,
+}
+
+/// HTTP/2 flow control decides how much data the edge may have in flight toward
+/// us before it has to stop and wait for an acknowledgement, which puts a hard
+/// ceiling of window / round-trip-time on a download. The h2 crate defaults to
+/// the RFC minimum of 64 KiB on both the stream and the connection, and 64 KiB
+/// over a 130 ms round trip is about 500 KB/s however fast the line underneath
+/// really is. QUIC and WireGuard never run into this because their windows are
+/// megabytes wide; this is what puts HTTP/2 on the same footing.
+fn h2_builder() -> h2::client::Builder {
+    let mut builder = h2::client::Builder::new();
+    builder
+        .initial_window_size(crate::sysprofile::h2_stream_window_bytes())
+        .initial_connection_window_size(crate::sysprofile::h2_connection_window_bytes())
+        .max_frame_size(H2_MAX_FRAME_SIZE);
+    builder
 }
 
 pub struct H2TunnelConfig {
@@ -40,6 +88,9 @@ pub struct H2TunnelConfig {
     pub quiet: bool,
     pub pin_endpoint: bool,
     pub expected_pins: Vec<Vec<u8>>,
+    /// The ECHConfigList the handshake offers: the session's, see `tls::session_ech`, or
+    /// none, as on the inner hop of masque-in-masque, which rides inside the outer one.
+    pub ech_config_list: Option<Vec<u8>>,
 }
 
 fn log_or_debug(quiet: bool, msg: String) {
@@ -59,17 +110,20 @@ fn validation_timeout() -> Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| v > 0)
+        .map(|v| v.min(86_400))
         .unwrap_or(10);
     Duration::from_secs(secs)
 }
 
 const DATA_PROBE_REQUIRED_SUCCESSES: u32 = 2;
+const DATA_PROBE_RESEND: Duration = Duration::from_millis(700);
 
 fn h2_keepalive_interval() -> Duration {
     let secs = std::env::var("AETHER_MASQUE_H2_KEEPALIVE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| v > 0)
+        .map(|v| v.min(86_400))
         .unwrap_or(15);
     Duration::from_secs(secs)
 }
@@ -79,6 +133,7 @@ fn h2_keepalive_timeout() -> Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&v| v > 0)
+        .map(|v| v.min(86_400))
         .unwrap_or(20);
     Duration::from_secs(secs)
 }
@@ -106,28 +161,8 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    builder
-        .set_min_proto_version(Some(SslVersion::TLS1_2))
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
-    builder
-        .set_max_proto_version(Some(SslVersion::TLS1_3))
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
-
-    builder.set_grease_enabled(true);
-
-    let groups = std::env::var("AETHER_TLS_GROUPS").ok();
-    let groups = groups
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(CHROME_GROUPS);
-    builder
-        .set_curves_list(groups)
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
-
-    builder
-        .set_alpn_protos(H2_ALPN)
-        .map_err(|e| AetherError::Tls(e.to_string()))?;
+    // The core's TLS fingerprint, with --tls-ciphers, --tls-groups and --disable-grease.
+    tls::Fingerprint::configured().apply(&mut builder, H2_ALPN)?;
 
     let cert = X509::from_pem(&cfg.cert_pem).map_err(|e| AetherError::Tls(e.to_string()))?;
     let key =
@@ -150,11 +185,9 @@ fn build_tls(cfg: &H2TunnelConfig) -> Result<boring::ssl::ConnectConfiguration> 
         .configure()
         .map_err(|e| AetherError::Tls(e.to_string()))?;
 
-    // When using pin-based verification, SNI may be spoofed for DPI bypass,
-    // so hostname verification against the cert's CN/SAN is not applicable.
-    // Standard CA verification requires hostname matching.
-    let use_pin_verification = cfg.pin_endpoint && !cfg.expected_pins.is_empty();
-    config.set_verify_hostname(!use_pin_verification);
+    // TLS server-certificate verification is unconditionally disabled
+    // (see tls::install_verification), so the hostname check is skipped too.
+    config.set_verify_hostname(false);
     config.set_use_server_name_indication(true);
 
     Ok(config)
@@ -173,26 +206,92 @@ fn build_connect_request(cfg: &H2TunnelConfig) -> Result<http::Request<()>> {
         .map_err(|e| AetherError::Masque(format!("build request: {e}")))
 }
 
+pub async fn dial(peer: std::net::SocketAddr) -> Result<TcpStream> {
+    match crate::upstream::configured() {
+        Some(proxy) => proxy.connect(peer).await,
+        None => crate::egress::tcp_connect(peer)
+            .await
+            .map_err(AetherError::Io),
+    }
+}
+
+/// Opens the TLS connection the HTTP/2 carrier runs on: dials the peer and shakes
+/// hands, offering the ECHConfigList of `cfg` when it has one. A server that turns that
+/// config down hands back the one it holds now; the handshake is made once more with
+/// it, and later handshakes of the session offer it as well, on either carrier.
+async fn connect_tls(
+    cfg: &H2TunnelConfig,
+    fragment: FragmentConfig,
+) -> Result<tokio_boring::SslStream<FragmentingStream<TcpStream>>> {
+    let mut ech = cfg.ech_config_list.clone();
+    let mut retried = false;
+    loop {
+        let mut tls_config = build_tls(cfg)?;
+        if let Some(list) = &ech {
+            // BoringSSL takes a key it offers nothing from, and the name would go in the clear.
+            tls::ensure_offerable(list)?;
+            tls_config
+                .set_ech_config_list(list)
+                .map_err(|e| AetherError::Tls(format!("h2 ech config: {e}")))?;
+        }
+        let tcp = dial(cfg.peer).await?;
+        let _ = tcp.set_nodelay(true);
+        let stream = FragmentingStream::new(tcp, fragment);
+        match tokio_boring::connect(tls_config, &cfg.sni, stream).await {
+            Ok(tls) => {
+                if ech.is_some() {
+                    // Nothing goes over a handshake that went without the key it was given.
+                    if !tls.ssl().ech_accepted() {
+                        return Err(AetherError::Ech("the handshake went without ECH".into()));
+                    }
+                    log_or_debug(cfg.quiet, "[h2] ech accepted".to_string());
+                }
+                return Ok(tls);
+            }
+            Err(e) => {
+                let message = e.to_string();
+                let retry = if !retried && ech.is_some() && rejected_ech(&message) {
+                    e.ssl()
+                        .and_then(|ssl| ssl.get_ech_retry_configs())
+                        .filter(|configs| !configs.is_empty())
+                        .and_then(tls::usable_retry)
+                } else {
+                    None
+                };
+                let Some(retry) = retry else {
+                    return Err(AetherError::Tls(format!("h2 tls handshake: {message}")));
+                };
+                log_or_debug(
+                    cfg.quiet,
+                    format!(
+                        "[h2] ech_required: retrying the handshake with the server's retry_configs ({} bytes)",
+                        retry.len()
+                    ),
+                );
+                tls::adopt_ech_retry(&retry);
+                ech = Some(retry);
+                retried = true;
+            }
+        }
+    }
+}
+
 pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Duration> {
     let start = Instant::now();
     let data_check = data_check_enabled();
 
     let attempt = async {
-        let tls_config = build_tls(cfg)?;
-        let tcp = TcpStream::connect(cfg.peer)
-            .await
-            .map_err(AetherError::Io)?;
-        let _ = tcp.set_nodelay(true);
-        let fragment = FragmentingStream::new(tcp, FragmentConfig::from_env());
-        let tls = tokio_boring::connect(tls_config, &cfg.sni, fragment)
-            .await
-            .map_err(|e| AetherError::Tls(format!("h2 tls handshake: {e}")))?;
-        let (h2, connection) = h2::client::handshake(tls)
+        let tls = connect_tls(cfg, FragmentConfig::from_env()).await?;
+        let (h2, connection) = h2_builder()
+            .handshake(tls)
             .await
             .map_err(|e| AetherError::Masque(format!("h2 handshake: {e}")))?;
-        let driver = tokio::spawn(async move {
-            let _ = connection.await;
-        });
+        let _driver = AbortOnDrop(
+            tokio::spawn(async move {
+                let _ = connection.await;
+            })
+            .abort_handle(),
+        );
         let mut h2 = h2
             .ready()
             .await
@@ -206,7 +305,6 @@ pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Durati
             .map_err(|e| AetherError::Masque(format!("await response: {e}")))?;
         let status = response.status();
         if !status.is_success() {
-            driver.abort();
             return Err(AetherError::Masque(format!(
                 "h2 connect-ip status {}",
                 status.as_u16()
@@ -214,7 +312,6 @@ pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Durati
         }
 
         if !data_check {
-            driver.abort();
             return Ok(());
         }
 
@@ -222,47 +319,51 @@ pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Durati
         let mut capsules = CapsuleParser::new();
         let probe = masque::build_dns_probe_packet(cfg.local_ipv4);
         let framed = masque::encode_datagram_capsule(&probe);
-        if let Err(e) = send_capsule(&mut send_stream, Bytes::from(framed)).await {
-            driver.abort();
-            return Err(e);
-        }
+        send_capsule(&mut send_stream, Bytes::from(framed)).await?;
 
         let mut probe_successes: u32 = 0;
+        let mut resend = tokio::time::interval(DATA_PROBE_RESEND);
+        resend.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        resend.tick().await;
 
         loop {
-            match futures::future::poll_fn(|cx| recv_body.poll_data(cx)).await {
-                Some(Ok(chunk)) => {
-                    let _ = recv_body.flow_control().release_capacity(chunk.len());
-                    capsules.push(&chunk);
-                    loop {
-                        match capsules.next() {
-                            Ok(Some(Capsule::Datagram(_))) => {
-                                probe_successes += 1;
-                                if probe_successes >= DATA_PROBE_REQUIRED_SUCCESSES {
-                                    driver.abort();
-                                    return Ok(());
-                                }
-                                let framed = masque::encode_datagram_capsule(&probe);
-                                if let Err(e) =
-                                    send_capsule(&mut send_stream, Bytes::from(framed)).await
-                                {
-                                    driver.abort();
-                                    return Err(e);
+            tokio::select! {
+                biased;
+
+                data = futures::future::poll_fn(|cx| recv_body.poll_data(cx)) => {
+                    match data {
+                        Some(Ok(chunk)) => {
+                            let _ = recv_body.flow_control().release_capacity(chunk.len());
+                            capsules.push(&chunk);
+                            loop {
+                                match capsules.next() {
+                                    Ok(Some(Capsule::Datagram(_))) => {
+                                        probe_successes += 1;
+                                        if probe_successes >= DATA_PROBE_REQUIRED_SUCCESSES {
+                                            return Ok(());
+                                        }
+                                        let framed = masque::encode_datagram_capsule(&probe);
+                                        send_capsule(&mut send_stream, Bytes::from(framed)).await?;
+                                        resend.reset();
+                                    }
+                                    Ok(Some(_)) => continue,
+                                    Ok(None) => break,
+                                    Err(_) => break,
                                 }
                             }
-                            Ok(Some(_)) => continue,
-                            Ok(None) => break,
-                            Err(_) => break,
+                        }
+                        Some(Err(e)) => {
+                            return Err(AetherError::Masque(format!("h2 body: {e}")));
+                        }
+                        None => {
+                            return Err(AetherError::Masque("h2 stream closed before data".into()));
                         }
                     }
                 }
-                Some(Err(e)) => {
-                    driver.abort();
-                    return Err(AetherError::Masque(format!("h2 body: {e}")));
-                }
-                None => {
-                    driver.abort();
-                    return Err(AetherError::Masque("h2 stream closed before data".into()));
+
+                _ = resend.tick() => {
+                    let framed = masque::encode_datagram_capsule(&probe);
+                    send_capsule(&mut send_stream, Bytes::from(framed)).await?;
                 }
             }
         }
@@ -275,13 +376,20 @@ pub async fn verify_h2(cfg: &H2TunnelConfig, timeout: Duration) -> Result<Durati
     }
 }
 
+async fn sleep_until_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+        None => std::future::pending().await,
+    }
+}
+
 pub async fn run(
     cfg: H2TunnelConfig,
     internals: Internals,
     addr_tx: Option<mpsc::Sender<AssignedAddr>>,
     ready_tx: Option<oneshot::Sender<()>>,
 ) -> Result<()> {
-    let (mut outbound_rx, inbound_tx, mut ctrl_rx) = internals.into_parts();
+    let (outbound_rx, inbound_tx, mut ctrl_rx) = internals.into_parts();
     let quiet = cfg.quiet;
     let data_check = data_check_enabled();
     let probe_packet = masque::build_dns_probe_packet(cfg.local_ipv4);
@@ -289,13 +397,7 @@ pub async fn run(
     let mut ready_fired = false;
     let mut validate_successes: u32 = 0;
 
-    let tls_config = build_tls(&cfg)?;
-
     log_or_debug(quiet, format!("[h2] connecting tcp to {}", cfg.peer));
-    let tcp = TcpStream::connect(cfg.peer)
-        .await
-        .map_err(AetherError::Io)?;
-    let _ = tcp.set_nodelay(true);
 
     let frag_cfg = FragmentConfig::from_env();
     if frag_cfg.enabled {
@@ -307,11 +409,8 @@ pub async fn run(
             ),
         );
     }
-    let fragment = FragmentingStream::new(tcp, frag_cfg);
 
-    let tls = tokio_boring::connect(tls_config, &cfg.sni, fragment)
-        .await
-        .map_err(|e| AetherError::Tls(format!("h2 tls handshake: {e}")))?;
+    let tls = connect_tls(&cfg, frag_cfg).await?;
     log_or_debug(
         quiet,
         format!(
@@ -320,9 +419,23 @@ pub async fn run(
         ),
     );
 
-    let (h2, mut connection) = h2::client::handshake(tls)
+    let (h2, mut connection) = h2_builder()
+        .handshake(tls)
         .await
         .map_err(|e| AetherError::Masque(format!("h2 handshake: {e}")))?;
+
+    // Worth saying out loud: this is the ceiling on a download, at
+    // window / round-trip-time, and it is the first thing to look at when the
+    // HTTP/2 carrier is slower than the line underneath it.
+    log_or_debug(
+        quiet,
+        format!(
+            "[h2] flow control: stream window {}KB, connection window {}KB, max frame {}KB",
+            crate::sysprofile::h2_stream_window_bytes() / 1024,
+            crate::sysprofile::h2_connection_window_bytes() / 1024,
+            H2_MAX_FRAME_SIZE / 1024,
+        ),
+    );
 
     let mut ping_pong = connection
         .ping_pong()
@@ -333,7 +446,7 @@ pub async fn run(
             log::debug!("[h2] connection driver ended: {e}");
         }
     });
-    let _driver_guard = AbortOnDrop(driver_handle);
+    let _driver_guard = AbortOnDrop(driver_handle.abort_handle());
 
     let mut h2 = h2
         .ready()
@@ -342,7 +455,7 @@ pub async fn run(
 
     let req = build_connect_request(&cfg)?;
 
-    let (resp_fut, mut send_stream) = h2
+    let (resp_fut, send_stream) = h2
         .send_request(req, false)
         .map_err(|e| AetherError::Masque(format!("send_request: {e}")))?;
     log_or_debug(
@@ -368,11 +481,25 @@ pub async fn run(
     let mut recv_body = response.into_body();
     let mut capsules = CapsuleParser::new();
 
+    // Sending gets a task of its own. Kept in the receive loop, a send that has
+    // to wait for the edge's window to open would stop poll_data from being
+    // polled as well, so a busy upload would stall the download alongside it.
+    let (sender_tx, sender_rx) = mpsc::channel::<SenderMsg>(16);
+    let (outcome_tx, mut sender_outcome) = oneshot::channel::<Result<()>>();
+    let sender_task = tokio::spawn(async move {
+        let _ = outcome_tx.send(pump_outbound(send_stream, outbound_rx, sender_rx).await);
+    });
+    let _sender_guard = AbortOnDrop(sender_task.abort_handle());
+
     let mut validate_deadline: Option<Instant> = None;
     if data_check {
         let framed = masque::encode_datagram_capsule(&probe_packet);
-        if let Err(e) = send_capsule(&mut send_stream, Bytes::from(framed)).await {
-            log::debug!("[h2] initial data-plane probe: {e}");
+        if sender_tx
+            .send(SenderMsg::Capsule(Bytes::from(framed)))
+            .await
+            .is_err()
+        {
+            log::debug!("[h2] initial data-plane probe: the send path is gone");
         }
         validate_deadline = Some(Instant::now() + validation_timeout());
         log_or_debug(
@@ -386,7 +513,7 @@ pub async fn run(
         }
     }
 
-    let mut probe_interval = tokio::time::interval(Duration::from_millis(700));
+    let mut probe_interval = tokio::time::interval(DATA_PROBE_RESEND);
     probe_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let keepalive_period = h2_keepalive_interval();
@@ -403,7 +530,7 @@ pub async fn run(
                     log::warn!(
                         "[h2] data-plane validation timed out; edge accepts control but drops traffic"
                     );
-                    let _ = send_stream.send_data(Bytes::new(), true);
+                    close_sender(&sender_tx, &mut sender_outcome).await;
                     return Err(AetherError::Masque(
                         "h2 data-plane validation timeout (handshake ok, no traffic)".into(),
                     ));
@@ -417,7 +544,7 @@ pub async fn run(
                     "[h2] no PING response from edge within {:?}; connection is stalled",
                     keepalive_timeout
                 );
-                let _ = send_stream.send_data(Bytes::new(), true);
+                close_sender(&sender_tx, &mut sender_outcome).await;
                 return Err(AetherError::Masque("h2 keepalive timeout".into()));
             }
         }
@@ -445,7 +572,7 @@ pub async fn run(
                     }
                     Err(e) => {
                         log::warn!("[h2] keepalive ping failed: {e}");
-                        let _ = send_stream.send_data(Bytes::new(), true);
+                        close_sender(&sender_tx, &mut sender_outcome).await;
                         return Err(AetherError::Masque(format!("h2 keepalive: {e}")));
                     }
                 }
@@ -453,15 +580,17 @@ pub async fn run(
 
             _ = probe_interval.tick(), if data_check && !ready_fired => {
                 let framed = masque::encode_datagram_capsule(&probe_packet);
-                if let Err(e) = send_capsule(&mut send_stream, Bytes::from(framed)).await {
-                    log::trace!("[h2] data-plane probe resend: {e}");
+                if sender_tx.try_send(SenderMsg::Capsule(Bytes::from(framed))).is_err() {
+                    log::trace!("[h2] data-plane probe resend was dropped");
                 }
             }
+
+            _ = sleep_until_deadline(pong_deadline) => {}
 
             ctrl = ctrl_rx.recv() => {
                 match ctrl {
                     Some(Control::Close) | None => {
-                        let _ = send_stream.send_data(Bytes::new(), true);
+                        close_sender(&sender_tx, &mut sender_outcome).await;
                         log_or_debug(quiet, "[h2] closing tunnel".to_string());
                         return Ok(());
                     }
@@ -469,20 +598,18 @@ pub async fn run(
                 }
             }
 
-            pkt = outbound_rx.recv() => {
-                match pkt {
-                    Some(ip_packet) => {
-                        let framed = masque::encode_datagram_capsule(&ip_packet);
-                        if let Err(e) = send_capsule(&mut send_stream, Bytes::from(framed)).await {
-                            log::debug!("[h2] send: {e}");
-                            return Err(e);
-                        }
+            outcome = &mut sender_outcome => {
+                return match outcome {
+                    Ok(Ok(())) => {
+                        log_or_debug(quiet, "[h2] send path closed".to_string());
+                        Ok(())
                     }
-                    None => {
-                        let _ = send_stream.send_data(Bytes::new(), true);
-                        return Ok(());
+                    Ok(Err(e)) => {
+                        log::debug!("[h2] send: {e}");
+                        Err(e)
                     }
-                }
+                    Err(_) => Err(AetherError::Masque("h2 send task stopped".into())),
+                };
             }
 
             data = futures::future::poll_fn(|cx| recv_body.poll_data(cx)) => {
@@ -506,10 +633,11 @@ pub async fn run(
                                 log_or_debug(quiet, "[h2] tunnel validated (end-to-end data confirmed); exposing socks5".to_string());
                             } else {
                                 let framed = masque::encode_datagram_capsule(&probe_packet);
-                                if let Err(e) =
-                                    send_capsule(&mut send_stream, Bytes::from(framed)).await
+                                if sender_tx
+                                    .try_send(SenderMsg::Capsule(Bytes::from(framed)))
+                                    .is_err()
                                 {
-                                    log::trace!("[h2] follow-up data-plane probe: {e}");
+                                    log::trace!("[h2] follow-up data-plane probe was dropped");
                                 }
                             }
                         }
@@ -523,6 +651,65 @@ pub async fn run(
                         return Ok(());
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Ends the request stream and waits briefly for the send task to get the
+/// closing frame out before the connection is torn down.
+async fn close_sender(
+    sender_tx: &mpsc::Sender<SenderMsg>,
+    outcome: &mut oneshot::Receiver<Result<()>>,
+) {
+    if sender_tx.send(SenderMsg::Finish).await.is_ok() {
+        let _ = tokio::time::timeout(SENDER_CLOSE_GRACE, outcome).await;
+    }
+}
+
+/// Owns the request stream and is the only thing that writes to it, so capsules
+/// cannot interleave and a wait for send capacity costs nothing but upload.
+async fn pump_outbound(
+    mut send: h2::SendStream<Bytes>,
+    mut outbound_rx: mpsc::Receiver<Vec<u8>>,
+    mut control_rx: mpsc::Receiver<SenderMsg>,
+) -> Result<()> {
+    let mut batch: Vec<u8> = Vec::with_capacity(H2_SEND_BATCH_BYTES);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            msg = control_rx.recv() => {
+                match msg {
+                    Some(SenderMsg::Capsule(framed)) => send_capsule(&mut send, framed).await?,
+                    Some(SenderMsg::Finish) | None => {
+                        let _ = send.send_data(Bytes::new(), true);
+                        return Ok(());
+                    }
+                }
+            }
+
+            packet = outbound_rx.recv() => {
+                let Some(packet) = packet else {
+                    let _ = send.send_data(Bytes::new(), true);
+                    return Ok(());
+                };
+
+                masque::append_datagram_capsule(&mut batch, &packet);
+
+                // Anything already queued behind this packet rides along, so a
+                // burst costs one frame rather than one frame per packet.
+                while batch.len() < H2_SEND_BATCH_BYTES {
+                    match outbound_rx.try_recv() {
+                        Ok(next) => masque::append_datagram_capsule(&mut batch, &next),
+                        Err(_) => break,
+                    }
+                }
+
+                let framed = Bytes::copy_from_slice(&batch);
+                batch.clear();
+                send_capsule(&mut send, framed).await?;
             }
         }
     }
@@ -609,5 +796,18 @@ fn bytes_to_ip(version: u8, bytes: &[u8]) -> Option<IpAddr> {
             Some(IpAddr::V6(b.into()))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_handshake_turned_down_for_its_ech_config_is_made_again() {
+        assert!(rejected_ech("TLS handshake failed [ECH_REJECTED]"));
+        assert!(!rejected_ech("TLS handshake failed [WRONG_VERSION_NUMBER]"));
+        assert!(!rejected_ech("unknown BoringSSL error"));
+        assert!(!rejected_ech("the SSL session has been shut down"));
     }
 }

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use rand::Rng;
-use rand::RngCore;
+use rand::RngExt;
 use tokio::net::UdpSocket;
 
 #[derive(Debug, Clone)]
@@ -41,6 +41,18 @@ impl NoizeConfig {
         }
     }
 
+    pub fn light() -> Self {
+        Self {
+            jc_before_hs: 1,
+            jc_after_i1: 0,
+            jmin: 32,
+            jmax: 96,
+            i1: Some("<b 0d0a0d0a><t><r 16>".to_string()),
+            i2: None,
+            junk_interval: Duration::from_millis(3),
+        }
+    }
+
     pub fn gfw() -> Self {
         Self {
             jc_before_hs: 2,
@@ -61,21 +73,22 @@ impl NoizeConfig {
 pub fn from_profile(name: &str) -> NoizeConfig {
     match name {
         "off" | "none" => NoizeConfig::off(),
-        "gfw" => NoizeConfig::gfw(),
+        "light" => NoizeConfig::light(),
+        "gfw" | "aggressive" | "heavy" => NoizeConfig::gfw(),
         _ => NoizeConfig::firewall(),
     }
 }
 
 fn junk_packet(cfg: &NoizeConfig) -> Vec<u8> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let (lo, hi) = if cfg.jmax > cfg.jmin && cfg.jmin > 0 {
         (cfg.jmin, cfg.jmax)
     } else {
         (40, 90)
     };
-    let size = rng.gen_range(lo..=hi);
+    let size = rng.random_range(lo..=hi);
     let mut buf = vec![0u8; size];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     buf
 }
 
@@ -119,7 +132,7 @@ fn parse_cps(spec: &str) -> Vec<u8> {
                 let len: usize = data.parse().unwrap_or(0).min(1024);
                 if len > 0 {
                     let mut r = vec![0u8; len];
-                    rand::thread_rng().fill_bytes(&mut r);
+                    rand::rng().fill_bytes(&mut r);
                     out.extend_from_slice(&r);
                 }
             }
@@ -131,6 +144,17 @@ fn parse_cps(spec: &str) -> Vec<u8> {
     out
 }
 
+async fn send_junk(sock: &UdpSocket, peer: SocketAddr, pkt: &[u8]) -> std::io::Result<usize> {
+    if sock.peer_addr().is_ok() {
+        return sock.send(pkt).await;
+    }
+    let target = match sock.local_addr() {
+        Ok(local) => crate::upstream::relay_target(local, peer),
+        Err(_) => peer,
+    };
+    sock.send_to(pkt, target).await
+}
+
 pub async fn pre_handshake(sock: &UdpSocket, peer: SocketAddr, cfg: &NoizeConfig) {
     if !cfg.is_enabled() {
         return;
@@ -140,7 +164,7 @@ pub async fn pre_handshake(sock: &UdpSocket, peer: SocketAddr, cfg: &NoizeConfig
 
     for i in 0..cfg.jc_before_hs {
         let pkt = junk_packet(cfg);
-        match sock.send_to(&pkt, peer).await {
+        match send_junk(sock, peer, &pkt).await {
             Ok(n) => log::trace!("junk[{i}] sent {n} bytes"),
             Err(e) => log::debug!("junk[{i}] send failed: {e}"),
         }
@@ -152,7 +176,7 @@ pub async fn pre_handshake(sock: &UdpSocket, peer: SocketAddr, cfg: &NoizeConfig
     if let Some(i1) = &cfg.i1 {
         let pkt = parse_cps(i1);
         if !pkt.is_empty() {
-            match sock.send_to(&pkt, peer).await {
+            match send_junk(sock, peer, &pkt).await {
                 Ok(n) => log::trace!("signature i1 sent {n} bytes"),
                 Err(e) => log::debug!("signature i1 send failed: {e}"),
             }
@@ -162,7 +186,7 @@ pub async fn pre_handshake(sock: &UdpSocket, peer: SocketAddr, cfg: &NoizeConfig
 
     for i in 0..cfg.jc_after_i1 {
         let pkt = junk_packet(cfg);
-        match sock.send_to(&pkt, peer).await {
+        match send_junk(sock, peer, &pkt).await {
             Ok(n) => log::trace!("junk_after[{i}] sent {n} bytes"),
             Err(e) => log::debug!("junk_after[{i}] send failed: {e}"),
         }
@@ -174,7 +198,7 @@ pub async fn pre_handshake(sock: &UdpSocket, peer: SocketAddr, cfg: &NoizeConfig
     if let Some(i2) = &cfg.i2 {
         let pkt = parse_cps(i2);
         if !pkt.is_empty() {
-            match sock.send_to(&pkt, peer).await {
+            match send_junk(sock, peer, &pkt).await {
                 Ok(n) => log::trace!("signature i2 sent {n} bytes"),
                 Err(e) => log::debug!("signature i2 send failed: {e}"),
             }
@@ -182,4 +206,50 @@ pub async fn pre_handshake(sock: &UdpSocket, peer: SocketAddr, cfg: &NoizeConfig
     }
 
     log::trace!("obfuscation pre-handshake complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_profile_the_app_offers_maps_to_a_distinct_config() {
+        let off = from_profile("off");
+        let light = from_profile("light");
+        let balanced = from_profile("balanced");
+        let aggressive = from_profile("aggressive");
+
+        assert!(!off.is_enabled());
+        assert!(light.is_enabled());
+        assert!(balanced.is_enabled());
+        assert!(aggressive.is_enabled());
+
+        assert_ne!(light.jmax, balanced.jmax);
+        assert_ne!(balanced.jmax, aggressive.jmax);
+    }
+
+    #[test]
+    fn noise_grows_with_the_profile_level() {
+        let light = from_profile("light");
+        let balanced = from_profile("balanced");
+        let aggressive = from_profile("aggressive");
+
+        assert!(light.jmax < balanced.jmax);
+        assert!(balanced.jmax < aggressive.jmax);
+    }
+
+    #[test]
+    fn the_legacy_profile_names_still_work() {
+        assert_eq!(from_profile("firewall").jmax, from_profile("balanced").jmax);
+        assert_eq!(from_profile("gfw").jmax, from_profile("aggressive").jmax);
+        assert!(!from_profile("none").is_enabled());
+    }
+
+    #[test]
+    fn an_unknown_profile_falls_back_to_the_balanced_default() {
+        assert_eq!(
+            from_profile("something-else").jmax,
+            from_profile("balanced").jmax
+        );
+    }
 }

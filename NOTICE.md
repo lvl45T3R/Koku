@@ -22,3 +22,10 @@ DNS Hunter support adapts the DNS Hunter method from network-checker by
 mirarr-app and contributors. It is GPL-3.0 licensed; attribution, source
 revision, and integration notes are retained in
 [`third_party/network-checker/UPSTREAM.md`](third_party/network-checker/UPSTREAM.md).
+
+The 0.4.0 integration also includes tun2proxy (MIT; license under
+`third_party/tun2proxy`), Arti/Tor and its Cargo dependencies (versions recorded in
+`native/Cargo.lock`), Psiphon tunnel core (GPL-3.0; unmodified license in
+`third_party/helpers/PSIPHON-LICENSE`), and Lyrebird (BSD-3-Clause with GPL-3.0
+components; licenses in `third_party/helpers`). Pinned source URLs and helper
+source archive details are in `PROVENANCE.md` and the release notes.

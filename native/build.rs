@@ -1,6 +1,11 @@
 use std::fs;
 
 fn main() {
+    println!("cargo:rustc-link-arg=-Wl,-z,max-page-size=16384");
+    if std::env::var("TARGET").unwrap_or_default().contains("android") {
+        // BoringSSL uses the NDK static C++ runtime; its ABI support is separate.
+        println!("cargo:rustc-link-lib=c++abi");
+    }
     println!("cargo:rerun-if-changed=../engine/REVISION");
     println!("cargo:rerun-if-changed=../engine/aether/src");
     println!("cargo:rerun-if-changed=../engine/quiche/quiche/src");

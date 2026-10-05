@@ -1,0 +1,10 @@
+﻿[package]
+name = "koku-core-contract-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ipnet = "2"
+regex = "1"
+log = "0.4"

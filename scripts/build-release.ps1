@@ -14,7 +14,9 @@ $ndk = Join-Path $repo '.tooling\android-ndk-r26b'
 $cmakeDir = Join-Path $repo '.tooling\cmake-3.27.9-windows-x86_64\bin'
 $ninjaDir = Join-Path $repo '.tooling\ninja-1.13.2'
 $llvmDir = Join-Path $repo '.tooling\llvm-18.1.8\bin'
-$cargoDir = Join-Path $env:USERPROFILE '.cargo\bin'
+$cargoDir = Join-Path $repo '.tooling\cargo\bin'
+$env:CARGO_HOME = Join-Path $repo '.tooling\cargo'
+$env:RUSTUP_HOME = Join-Path $repo '.tooling\rustup'
 
 $required = @(
     (Join-Path $ndk 'source.properties'),
@@ -36,6 +38,8 @@ if ($ndkSha1 -ne '17453C61A59E848CFFB8634F2C7B322417F1732E') {
 
 $env:ANDROID_NDK_HOME = $ndk.Replace('\', '/')
 $env:CMAKE = (Join-Path $cmakeDir 'cmake.exe').Replace('\', '/')
+$env:CXXSTDLIB = 'c++_static'
+$env:BORING_BSSL_RUST_CPPLIB = 'c++_static'
 $env:CMAKE_GENERATOR = 'Ninja'
 $env:CMAKE_MAKE_PROGRAM = (Join-Path $ninjaDir 'ninja.exe').Replace('\', '/')
 $env:LIBCLANG_PATH = $llvmDir
@@ -50,22 +54,31 @@ $matrix = @{
 }
 
 if (-not $SkipNative) {
+    $buildArgs = @('build', '--locked', '--release', '--jobs', '1')
     foreach ($abi in $Abis) {
         $target = $matrix[$abi].Target
         $targetKey = $target.Replace('-', '_')
         [Environment]::SetEnvironmentVariable("CC_$targetKey", "$toolchainBin/clang.exe", 'Process')
         [Environment]::SetEnvironmentVariable("CXX_$targetKey", "$toolchainBin/clang++.exe", 'Process')
         [Environment]::SetEnvironmentVariable("AR_$targetKey", "$toolchainBin/llvm-ar.exe", 'Process')
+        $clangTarget = $matrix[$abi].Linker.Replace('-clang.cmd', '')
+        $targetFlags = "--target=$clangTarget"
+        if ($abi -eq 'armeabi-v7a') { $targetFlags += ' -march=armv7-a -mthumb' }
+        [Environment]::SetEnvironmentVariable("CFLAGS_$targetKey", $targetFlags, 'Process')
+        [Environment]::SetEnvironmentVariable("CXXFLAGS_$targetKey", $targetFlags, 'Process')
         [Environment]::SetEnvironmentVariable("CARGO_TARGET_$($targetKey.ToUpperInvariant())_LINKER", "$toolchainBin/$($matrix[$abi].Linker)", 'Process')
 
-        Push-Location (Join-Path $repo 'native')
-        try {
-            & cargo build --locked --target $target --release
-            if ($LASTEXITCODE -ne 0) { throw "Native build failed for $abi" }
-        } finally {
-            Pop-Location
-        }
-
+        $buildArgs += @('--target', $target)
+    }
+    Push-Location (Join-Path $repo 'native')
+    try {
+        & cargo @buildArgs
+        if ($LASTEXITCODE -ne 0) { throw 'Native matrix build failed' }
+    } finally {
+        Pop-Location
+    }
+    foreach ($abi in $Abis) {
+        $target = $matrix[$abi].Target
         $source = Join-Path $repo "native\target\$target\release\libaether_android.so"
         $destination = Join-Path $repo "app\src\main\jniLibs\$abi\libaether_android.so"
         New-Item -ItemType Directory -Force (Split-Path -Parent $destination) | Out-Null

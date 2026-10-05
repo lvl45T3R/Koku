@@ -153,8 +153,8 @@ private data class AppProxyEntry(
 private fun AetherScreen() {
     val context = LocalContext.current
     var selectedTab by remember { mutableStateOf(AppTab.HOME) }
-    var protocol by remember { mutableStateOf("masque-h2") }
-    var scanMode by remember { mutableStateOf("turbo") }
+    var protocol by remember { mutableStateOf(context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE).getString("protocol", "masque-h2") ?: "masque-h2") }
+    var scanMode by remember { mutableStateOf(context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE).getString("scan", "balanced") ?: "balanced") }
     var noIrExit by remember { mutableStateOf(loadNoIrExit(context)) }
     var dnsStormMode by remember { mutableStateOf(loadDnsStormMode(context)) }
     var dnsStormCustomResolvers by remember { mutableStateOf(loadDnsStormCustomResolvers(context)) }
@@ -249,7 +249,7 @@ private fun AetherScreen() {
     }
     LaunchedEffect(tunnelState, noIrExit) {
         if (tunnelState == TunnelState.CONNECTED && !noIrExit) {
-            ConnectionProbe.refresh(context)
+            ConnectionProbe.awaitNativeVerification()
         } else if (tunnelState == TunnelState.IDLE) {
             ConnectionProbe.reset()
         }
@@ -311,8 +311,8 @@ private fun AetherScreen() {
                     perAppProxyMode = perAppProxyMode,
                     selectedPackages = proxyPackages,
                     protocolEnabled = startEnabled,
-                    onProtocolChange = { protocol = it },
-                    onScanModeChange = { scanMode = it },
+                    onProtocolChange = { protocol = it; context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE).edit().putString("protocol", it).apply() },
+                    onScanModeChange = { scanMode = it; context.getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE).edit().putString("scan", it).apply() },
                     onNoIrExitChange = {
                         noIrExit = it
                         saveNoIrExit(context, it)
@@ -905,6 +905,16 @@ private fun SettingsScreen(
                         enabled = protocolEnabled,
                         onSelect = onProtocolChange,
                     )
+                    for ((value, label, detail) in listOf(
+                        Triple("gool-h2", "Gool over H2", "WireGuard inside MASQUE HTTP/2"),
+                        Triple("gool-h3", "Gool over H3", "WireGuard inside MASQUE QUIC"),
+                        Triple("gool-classic", "Classic gool", "WireGuard inside WireGuard"),
+                        Triple("mim-h2", "MASQUE in MASQUE H2", "Two nested HTTP/2 tunnels"),
+                        Triple("mim-h3", "MASQUE in MASQUE H3", "Two nested QUIC tunnels"),
+                    )) {
+                        ProtocolOption(label = label, detail = detail, value = value, selected = protocol,
+                            enabled = protocolEnabled, onSelect = onProtocolChange)
+                    }
                     if (!protocolEnabled) {
                         Text(
                             "Disconnect before changing protocol.",
@@ -915,6 +925,8 @@ private fun SettingsScreen(
                 }
             }
         }
+
+        item { EngineOptionsCard(enabled = protocolEnabled) }
 
         item {
             Card(
@@ -1013,7 +1025,7 @@ private fun SettingsScreen(
                         onSelect = { onNoIrExitChange(false) },
                     )
                     Text(
-                        "When enabled, Koku tests up to four routes before opening the Android packet bridge. Connection fails closed if every route is Iranian or cannot be verified.",
+                        "Checks the exit before opening the packet bridge and monitors WARP exit changes. Also validates the final Tor/Psiphon exit. Iranian or unverifiable exits fail closed.",
                         color = Muted,
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -1048,6 +1060,14 @@ private fun SettingsScreen(
                         enabled = protocolEnabled,
                         onSelect = onScanModeChange,
                     )
+                    for ((value, label, detail) in listOf(
+                        Triple("balanced", "Balanced", "Collect several candidates and keep the fastest"),
+                        Triple("thorough", "Thorough", "Sweep full ranges on restrictive networks"),
+                        Triple("verified", "Verified", "Measured endpoints; separate ranges for nested hops"),
+                    )) {
+                        ProtocolOption(label = label, detail = detail, value = value, selected = scanMode,
+                            enabled = protocolEnabled, onSelect = onScanModeChange)
+                    }
                     Text(
                         "Reliable takes longer, but only selects a gateway after an end-to-end request succeeds.",
                         color = Muted,
@@ -1591,16 +1611,13 @@ private suspend fun checkForUpdateAndInstall(context: Context): String = withCon
         val currentVersion = appVersionName(context)
         if (isNewerVersion(latestVersion, currentVersion)) {
             val assets = release.getJSONArray("assets")
-            var apkUrl: String? = null
-            for (index in 0 until assets.length()) {
-                val asset = assets.getJSONObject(index)
-                val name = asset.optString("name")
-                if (name.endsWith(".apk") && "arm64-v8a" in name) {
-                    apkUrl = asset.getString("browser_download_url")
-                    break
-                }
-            }
-            val downloadUrl = apkUrl ?: return@runCatching "Latest release has no ARM64 APK asset."
+            val apks = (0 until assets.length()).map(assets::getJSONObject)
+                .filter { it.optString("name").endsWith(".apk") }
+            val selected = Build.SUPPORTED_ABIS.firstNotNullOfOrNull { abi ->
+                apks.firstOrNull { it.optString("name").endsWith("-$abi.apk") }
+            } ?: apks.firstOrNull { "universal" in it.optString("name", "") }
+            val downloadUrl = selected?.getString("browser_download_url")
+                ?: return@runCatching "Latest release has no compatible APK asset."
             val apk = downloadApk(context, latestVersion, downloadUrl)
             withContext(Dispatchers.Main) {
                 installApk(context, apk)

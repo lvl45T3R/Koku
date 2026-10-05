@@ -1,154 +1,58 @@
-#![allow(dead_code)]
-
-#[path = "../../engine/aether/src/account.rs"]
-mod account;
-#[path = "../../engine/aether/src/aethernoize.rs"]
-mod aethernoize;
-#[path = "../../engine/aether/src/config.rs"]
-mod config;
-#[path = "../../engine/aether/src/consts.rs"]
-mod consts;
-#[path = "../../engine/aether/src/error.rs"]
-mod error;
-#[path = "../../engine/aether/src/fragment.rs"]
-mod fragment;
-#[path = "../../engine/aether/src/masque.rs"]
-mod masque;
-#[path = "../../engine/aether/src/masque_h2.rs"]
-mod masque_h2;
-#[path = "../../engine/aether/src/netstack.rs"]
-mod netstack;
-#[path = "../../engine/aether/src/noize.rs"]
-mod noize;
-#[path = "../../engine/aether/src/prober.rs"]
-mod prober;
-#[path = "../../engine/aether/src/quic.rs"]
-mod quic;
-#[path = "../../engine/aether/src/socks.rs"]
-mod socks;
-#[path = "../../engine/aether/src/sysprofile.rs"]
-mod sysprofile;
-#[path = "../../engine/aether/src/tls.rs"]
-mod tls;
-#[path = "../../engine/aether/src/tunnelping.rs"]
-mod tunnelping;
-#[path = "../../engine/aether/src/wg_prober.rs"]
-mod wg_prober;
-#[path = "../../engine/aether/src/wireguard.rs"]
-mod wireguard;
-
-use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
-use std::fs::File;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
-use std::thread;
-
-use error::{AetherError, Result};
+#![recursion_limit = "512"]
+use aether::error::{AetherError, Result};
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::sys::{jint, jlong};
 use jni::{JNIEnv, JavaVM};
 use serde::Deserialize;
-use tokio::io::unix::AsyncFd;
-use tokio::sync::{mpsc, oneshot};
-
-const VPN_IPV4: Ipv4Addr = Ipv4Addr::new(172, 31, 19, 2);
-const MAX_NO_IR_ROUTE_ATTEMPTS: usize = 4;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::oneshot;
 
 static LOG_INIT: Once = Once::new();
 static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
 static RUNS: OnceLock<Mutex<HashMap<i64, oneshot::Sender<()>>>> = OnceLock::new();
 static LOG_TARGET: OnceLock<Mutex<Option<LogTarget>>> = OnceLock::new();
 static LOGGER: AndroidUiLogger = AndroidUiLogger;
-
 struct LogTarget {
     vm: JavaVM,
     callback: GlobalRef,
 }
-
 struct AndroidUiLogger;
-
 impl log::Log for AndroidUiLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::max_level()
     }
-
     fn log(&self, record: &log::Record<'_>) {
-        if !self.enabled(record.metadata()) {
-            return;
+        if self.enabled(record.metadata()) {
+            let message = record.args().to_string();
+            write_android_log(record.level(), &message);
+            write_ui_log(record.level(), &message);
         }
-        let message = record.args().to_string();
-        write_android_log(record.level(), &message);
-        write_ui_log(record.level(), &message);
     }
-
     fn flush(&self) {}
 }
-
-#[derive(Default)]
-struct TrafficStats {
-    outbound_packets: AtomicU64,
-    outbound_bytes: AtomicU64,
-    inbound_packets: AtomicU64,
-    inbound_bytes: AtomicU64,
-}
-
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AndroidConfig {
-    #[serde(default = "default_protocol")]
     protocol: String,
-    #[serde(default = "default_scan")]
     scan_mode: String,
-    #[serde(default = "default_ip")]
-    ip_mode: String,
-    #[serde(default = "default_noize")]
     noize_profile: String,
-    #[serde(default)]
     no_ir_exit: bool,
     config_dir: String,
+    #[serde(default)]
+    options: HashMap<String, String>,
+    #[serde(default)]
+    psiphon_bin: String,
 }
-
-fn default_protocol() -> String {
-    "masque-h2".into()
+fn runs() -> &'static Mutex<HashMap<i64, oneshot::Sender<()>>> {
+    RUNS.get_or_init(|| Mutex::new(HashMap::new()))
 }
-
-fn is_h2_protocol(protocol: &str) -> bool {
-    matches!(
-        protocol.trim().to_ascii_lowercase().as_str(),
-        "masque-h2" | "masque-h2-stormdns"
-    )
-}
-
-fn default_scan() -> String {
-    "balanced".into()
-}
-
-fn default_ip() -> String {
-    "v4".into()
-}
-
-fn default_noize() -> String {
-    "balanced".into()
-}
-
-fn profile_candidates(primary: &str, wireguard: bool) -> Vec<String> {
-    let fallbacks: &[&str] = if wireguard {
-        &["balanced", "aggressive", "light", "off"]
-    } else {
-        &["firewall", "gfw", "off"]
-    };
-    let mut names = vec![primary.to_lowercase()];
-    for fallback in fallbacks {
-        if !names.iter().any(|name| name.eq_ignore_ascii_case(fallback)) {
-            names.push((*fallback).to_string());
-        }
-    }
-    names
-}
-
 #[no_mangle]
 pub extern "system" fn Java_io_github_lvl45t3r_koku_AetherNative_nativeStart(
     mut env: JNIEnv,
@@ -158,95 +62,86 @@ pub extern "system" fn Java_io_github_lvl45t3r_koku_AetherNative_nativeStart(
     log_sink: JObject,
 ) -> jlong {
     init_logging();
-    sysprofile::log_summary();
-    if let Err(err) = set_log_target(&mut env, log_sink) {
-        log::error!("could not attach the in-app logger: {err}");
-    }
-
     let json: String = match env.get_string(&config_json) {
-        Ok(value) => value.into(),
-        Err(err) => {
-            log::error!("invalid JNI config string: {err}");
+        Ok(v) => v.into(),
+        Err(_) => {
             close_fd(tun_fd);
             return 0;
         }
     };
     let cfg: AndroidConfig = match serde_json::from_str(&json) {
-        Ok(value) => value,
-        Err(err) => {
-            log::error!("invalid Android config: {err}");
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("Invalid config: {e}");
             close_fd(tun_fd);
             return 0;
         }
     };
-    if cfg.config_dir.is_empty() {
-        log::error!("Android configDir is empty");
+    if cfg.config_dir.is_empty()
+        || ACTIVE
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
         close_fd(tun_fd);
+        log::error!("Native engine is still stopping or config is invalid");
         return 0;
     }
-
-    log::info!(
-        "native build uses vendored Koku engine snapshot {}",
-        env!("KOKU_ENGINE_SOURCE"),
-    );
-    log::info!(
-        "startup config: protocol={}, scan={}, ip={}, noize={}, no_ir_exit={}",
-        cfg.protocol,
-        cfg.scan_mode,
-        cfg.ip_mode,
-        cfg.noize_profile,
-        cfg.no_ir_exit,
-    );
-
+    if let Err(e) = set_log_target(&mut env, log_sink) {
+        log::error!("Logger: {e}");
+    }
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-    let (stop_tx, stop_rx) = oneshot::channel();
-    runs().lock().unwrap().insert(handle, stop_tx);
-
-    thread::Builder::new()
+    let (tx, rx) = oneshot::channel();
+    runs().lock().unwrap().insert(handle, tx);
+    match std::thread::Builder::new()
         .name("aether-native".into())
+        .stack_size(16 * 1024 * 1024)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .worker_threads(3)
-                .thread_name("aether-io")
+                .thread_stack_size(8 * 1024 * 1024)
                 .build();
             match runtime {
-                Ok(rt) => match rt.block_on(run_android(cfg, tun_fd, stop_rx)) {
-                    Ok(()) => log::info!("Aether engine stopped cleanly"),
-                    Err(err) => log::error!("Aether engine stopped with error: {err}"),
-                },
-                Err(err) => {
+                Ok(rt) => {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rt.block_on(run_android(cfg, tun_fd, rx))
+                    }));
+                    match result {
+                        Ok(Ok(())) => log::info!("Aether engine stopped cleanly"),
+                        Ok(Err(e)) => log::error!("Aether engine stopped with error: {e}"),
+                        Err(_) => log::error!("Aether engine panicked"),
+                    }
+                    drop(rt);
+                }
+                Err(e) => {
                     close_fd(tun_fd);
-                    log::error!("failed to create runtime: {err}");
+                    log::error!("Runtime: {e}");
                 }
             }
             runs().lock().unwrap().remove(&handle);
-        })
-        .map(|_| handle)
-        .unwrap_or_else(|err| {
-            log::error!("failed to start native thread: {err}");
+            ACTIVE.store(false, Ordering::SeqCst);
+            log::info!("native worker finished");
+        }) {
+        Ok(_) => handle,
+        Err(e) => {
             runs().lock().unwrap().remove(&handle);
+            ACTIVE.store(false, Ordering::SeqCst);
             close_fd(tun_fd);
+            log::error!("Native thread: {e}");
             0
-        })
+        }
+    }
 }
-
 #[no_mangle]
 pub extern "system" fn Java_io_github_lvl45t3r_koku_AetherNative_nativeStop(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
 ) {
-    if let Some(stop) = runs().lock().unwrap().remove(&handle) {
-        log::info!("native stop signal sent for handle {handle}");
-        let _ = stop.send(());
+    if let Some(tx) = runs().lock().unwrap().remove(&handle) {
+        let _ = tx.send(());
     }
 }
-
-fn runs() -> &'static Mutex<HashMap<i64, oneshot::Sender<()>>> {
-    RUNS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn init_logging() {
     LOG_INIT.call_once(|| {
         if log::set_logger(&LOGGER).is_ok() {
@@ -320,904 +215,353 @@ fn close_fd(fd: i32) {
     }
 }
 
+mod settings;
+mod packet;
+use settings::OPTIONS;
+#[derive(Default)]
+struct Traffic {
+    out_packets: AtomicU64,
+    out_bytes: AtomicU64,
+    in_packets: AtomicU64,
+    in_bytes: AtomicU64,
+    out_tcp_payload: AtomicU64,
+    in_tcp_payload: AtomicU64,
+}
+struct CountingDevice {
+    inner: tun::AsyncDevice,
+    stats: Arc<Traffic>,
+}
+impl AsyncRead for CountingDevice {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            let n = buf.filled().len() - before;
+            if n > 0 {
+                self.stats.out_packets.fetch_add(1, Ordering::Relaxed);
+                self.stats.out_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                self.stats.out_tcp_payload.fetch_add(packet::tcp_payload_len(&buf.filled()[before..]) as u64, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+}
+impl AsyncWrite for CountingDevice {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, data);
+        if let Poll::Ready(Ok(n)) = result {
+            if n > 0 {
+                self.stats.in_packets.fetch_add(1, Ordering::Relaxed);
+                self.stats.in_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                self.stats.in_tcp_payload.fetch_add(packet::tcp_payload_len(&data[..n]) as u64, Ordering::Relaxed);
+            }
+        }
+        result
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+fn configure(cfg: &AndroidConfig) -> Result<String> {
+    // The worker is exclusive: no stale settings or credentials cross into the next session.
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("AETHER_")) {
+        std::env::remove_var(key);
+    }
+    for (key, value) in &cfg.options {
+        if !OPTIONS.contains(&key.as_str()) {
+            return Err(AetherError::Other(format!("Unsupported setting: {key}")));
+        }
+        if !value.trim().is_empty() {
+            std::env::set_var(key, value.trim());
+        }
+    }
+    let (protocol, h2, classic) = settings::transport(&cfg.protocol)
+        .ok_or_else(|| AetherError::Other("Unknown tunnel protocol".into()))?;
+    std::env::set_var("AETHER_PROTOCOL", protocol);
+    std::env::set_var("AETHER_MASQUE_HTTP2", if h2 { "1" } else { "0" });
+    std::env::set_var(
+        "AETHER_GOOL_MODE",
+        if classic { "classic" } else { "masque" },
+    );
+    std::env::set_var("AETHER_SCAN", &cfg.scan_mode);
+    if !cfg.options.contains_key("AETHER_NOIZE") {
+        std::env::set_var(
+            "AETHER_NOIZE",
+            if cfg.noize_profile == "balanced" && protocol != "wg" && !classic {
+                "firewall"
+            } else {
+                &cfg.noize_profile
+            },
+        );
+    }
+    if !cfg.options.contains_key("AETHER_IP") {
+        std::env::set_var("AETHER_IP", "v4");
+    }
+    if !cfg.options.contains_key("AETHER_QUICK_RECONNECT") {
+        std::env::set_var("AETHER_QUICK_RECONNECT", "1");
+    }
+    std::env::set_var(
+        "AETHER_CONFIG",
+        format!("{}/aether-wireguard.toml", cfg.config_dir),
+    );
+    std::env::set_var(
+        "AETHER_MASQUE_CONFIG",
+        format!("{}/aether-masque.toml", cfg.config_dir),
+    );
+    std::env::set_var("AETHER_SOCKS", "127.0.0.1:1819");
+    std::env::set_var("AETHER_HTTP_PROXY", "127.0.0.1:1830");
+    std::env::set_var("AETHER_TOR_BIND", "127.0.0.1:1820");
+    std::env::set_var("AETHER_TOR_HTTP", "127.0.0.1:1831");
+    std::env::set_var("AETHER_PSIPHON_BIND", "127.0.0.1:1821");
+    std::env::set_var("AETHER_PSIPHON_HTTP", "127.0.0.1:1832");
+    if !cfg.psiphon_bin.is_empty() {
+        std::env::set_var("AETHER_PSIPHON_BIN", &cfg.psiphon_bin);
+    }
+    if !cfg.options.contains_key("AETHER_TOR_PT") {
+        if let Some(directory) = std::path::Path::new(&cfg.psiphon_bin).parent() {
+            let helper = directory.join("liblyrebird.so");
+            if helper.is_file() {
+                let transports = [
+                    "obfs4",
+                    "obfs3",
+                    "scramblesuit",
+                    "meek_lite",
+                    "snowflake",
+                    "webtunnel",
+                ]
+                .map(|name| format!("{name}={}", helper.display()))
+                .join(";");
+                std::env::set_var("AETHER_TOR_PT", transports);
+            }
+        }
+    }
+    if cfg.no_ir_exit {
+        std::env::set_var("AETHER_EXIT_LOC", "!IR");
+    }
+    let tor = aether::tor::mode();
+    let psiphon = aether::psiphon::mode();
+    if tor != aether::tor::Mode::Off && psiphon != aether::psiphon::Mode::Off {
+        return Err(AetherError::Other(
+            "Choose Tor or Psiphon as the final carrier".into(),
+        ));
+    }
+    Ok(if tor == aether::tor::Mode::Chain {
+        "127.0.0.1:1820"
+    } else if psiphon == aether::psiphon::Mode::Chain {
+        "127.0.0.1:1821"
+    } else {
+        "127.0.0.1:1819"
+    }
+    .into())
+}
+async fn wait_proxy(address: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut stream = tokio::net::TcpStream::connect(address).await?;
+            stream.write_all(&[5, 1, 0]).await?;
+            let mut reply = [0; 2];
+            stream.read_exact(&mut reply).await?;
+            Ok::<bool, std::io::Error>(reply == [5, 0])
+        })
+        .await;
+        if matches!(ready, Ok(Ok(true))) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+}
 async fn run_android(
     cfg: AndroidConfig,
     tun_fd: i32,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<()> {
-    log::info!("initializing vendored Aether engine");
+    // Adopt the detached fd immediately; every error path closes it.
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(tun_fd) };
     std::fs::create_dir_all(&cfg.config_dir)?;
-    std::env::set_var("AETHER_NOIZE", &cfg.noize_profile);
-    std::env::set_var(
-        "AETHER_MASQUE_HTTP2",
-        if is_h2_protocol(&cfg.protocol) {
-            "1"
-        } else {
-            "0"
-        },
-    );
-
-    let flags = unsafe { libc::fcntl(tun_fd, libc::F_GETFL) };
-    if flags < 0 || unsafe { libc::fcntl(tun_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        close_fd(tun_fd);
-        return Err(AetherError::Io(std::io::Error::last_os_error()));
-    }
-    let file = unsafe { File::from_raw_fd(tun_fd) };
-    let tun = Arc::new(AsyncFd::new(file)?);
-    log::info!("Android TUN fd is active and non-blocking");
-
-    if cfg.protocol.eq_ignore_ascii_case("wireguard") || cfg.protocol.eq_ignore_ascii_case("wg") {
-        run_wireguard(cfg, tun, &mut stop).await
-    } else {
-        run_masque(cfg, tun, &mut stop).await
-    }
-}
-
-async fn load_or_create_identity(path: &str, masque: bool) -> Result<account::Identity> {
-    let mut identity = match config::load(path)? {
-        Some(value) => value,
-        None => {
-            log::info!("provisioning a new WARP identity");
-            let value =
-                account::provision_wg(consts::DEFAULT_MODEL, consts::DEFAULT_LOCALE, None).await?;
-            config::save(path, &value)?;
-            value
-        }
-    };
-    if masque && !identity.has_masque_credentials() {
-        log::info!("enrolling MASQUE credentials");
-        let (cert_pem, key_pem) = account::ensure_masque_enrolled(&identity).await?;
-        identity.cert_pem = cert_pem;
-        identity.key_pem = key_pem;
-        config::save(path, &identity)?;
-    }
-    Ok(identity)
-}
-
-async fn run_wireguard(
-    cfg: AndroidConfig,
-    tun: Arc<AsyncFd<File>>,
-    stop: &mut oneshot::Receiver<()>,
-) -> Result<()> {
-    let path = format!("{}/aether-wireguard.toml", cfg.config_dir);
-    let identity = tokio::select! {
-        value = load_or_create_identity(&path, false) => value?,
-        _ = &mut *stop => return Ok(()),
-    };
-    let local_ipv4: Ipv4Addr = identity
-        .ipv4
-        .split('/')
-        .next()
-        .unwrap_or(&identity.ipv4)
-        .parse()
-        .map_err(|_| AetherError::Other("invalid identity IPv4".into()))?;
-    log::info!("WARP identity ready with tunnel IPv4 {local_ipv4}");
-    let private_key = identity.private_key_bytes()?;
-    let public_key = identity.peer_public_key_bytes()?;
-    let local_ipv6 = identity
-        .ipv6
-        .split('/')
-        .next()
-        .unwrap_or(&identity.ipv6)
-        .parse()
-        .map_err(|_| AetherError::Other("invalid identity IPv6".into()))?;
-    let mut profile_name = cfg.noize_profile.clone();
-    let mut profile = aethernoize::from_profile(&profile_name);
-    let scan_mode = wg_prober::WgScanMode::parse(&cfg.scan_mode);
-    let mut last_good_peer: Option<SocketAddr> = None;
-    let mut rejected_exit_peers = HashSet::new();
-
-    loop {
-        let mut selected_peer = None;
-        if let Some(peer) = last_good_peer {
-            log::info!("retrying last known-good WireGuard endpoint {peer}");
-            let retry = tokio::select! {
-                value = wireguard::verify_endpoint(
-                    peer,
-                    private_key,
-                    public_key,
-                    identity.client_id,
-                    local_ipv4,
-                    &profile,
-                    std::time::Duration::from_secs(6),
-                    None,
-                ) => Some(value),
-                _ = &mut *stop => None,
-            };
-            let Some(retry) = retry else {
-                return Ok(());
-            };
-            match retry {
-                Ok(_) => {
-                    log::info!("last known-good WireGuard endpoint is still healthy");
-                    selected_peer = Some(peer);
-                }
-                Err(error) => {
-                    log::warn!(
-                        "last known-good WireGuard endpoint failed verification: {error}; rescanning"
-                    );
-                }
-            }
-        }
-
-        let peer = match selected_peer {
-            Some(peer) => peer,
-            None => {
-                log::info!("scanning for a working WireGuard endpoint");
-                let mut selected = None;
-                let mut last_error = None;
-                for candidate_name in profile_candidates(&profile_name, true) {
-                    let candidate_profile = aethernoize::from_profile(&candidate_name);
-                    let probe = wg_prober::WgProbe {
-                        private_key: Arc::new(private_key),
-                        peer_public_key: Arc::new(public_key),
-                        client_id: identity.client_id,
-                        local_ipv4,
-                        aethernoize: candidate_profile.clone(),
-                        ports: wireguard::WG_PORTS.to_vec(),
-                        ip: prober::IpScan::parse(&cfg.ip_mode),
-                    };
-                    log::info!("testing WireGuard noize profile '{candidate_name}'");
-                    let found = tokio::select! {
-                        value = wg_prober::hunt_best_wg_endpoint_excluding(
-                            &probe,
-                            scan_mode,
-                            &rejected_exit_peers,
-                        ) => value,
-                        _ = &mut *stop => return Ok(()),
-                    };
-                    match found {
-                        Ok(found) => {
-                            profile_name = candidate_name;
-                            profile = candidate_profile;
-                            selected = Some(SocketAddr::new(found.ip, found.port));
-                            break;
-                        }
-                        Err(error) => {
-                            log::warn!("WireGuard profile '{candidate_name}' failed: {error}");
-                            last_error = Some(error.to_string());
-                        }
-                    }
-                }
-                selected.ok_or_else(|| {
-                    AetherError::Other(format!(
-                        "all WireGuard profiles failed: {}",
-                        last_error.unwrap_or_else(|| "no endpoint".to_string())
-                    ))
-                })?
-            }
-        };
-        log::info!("using WireGuard endpoint {peer}");
-
-        if cfg.no_ir_exit {
-            let route = tokio::select! {
-                value = verify_wireguard_exit(
-                    peer,
-                    private_key,
-                    public_key,
-                    identity.client_id,
-                    local_ipv4,
-                    local_ipv6,
-                    &profile,
-                ) => value,
-                _ = &mut *stop => return Ok(()),
-            };
-            match route {
-                Ok(route) if !route.country_code.eq_ignore_ascii_case("IR") => {
-                    log_verified_exit(&route);
-                }
-                Ok(route) => {
-                    log::warn!(
-                        "NO-IR exit rejected endpoint {peer}: ip={}, country={}, colo={}",
-                        route.ip,
-                        route.country_code,
-                        route.colo,
-                    );
-                    rejected_exit_peers.insert(peer);
-                    last_good_peer = None;
-                    if rejected_exit_peers.len() >= MAX_NO_IR_ROUTE_ATTEMPTS {
-                        return Err(AetherError::Other(format!(
-                            "NO-IR Exit could not find a non-Iran route after {} attempts",
-                            rejected_exit_peers.len()
-                        )));
-                    }
-                    continue;
-                }
-                Err(error) => {
-                    log::warn!("NO-IR exit verification failed for {peer}: {error}");
-                    rejected_exit_peers.insert(peer);
-                    last_good_peer = None;
-                    if rejected_exit_peers.len() >= MAX_NO_IR_ROUTE_ATTEMPTS {
-                        return Err(AetherError::Other(format!(
-                            "NO-IR Exit could not verify a safe route after {} attempts: {error}",
-                            rejected_exit_peers.len()
-                        )));
-                    }
-                    continue;
-                }
-            }
-        }
-        last_good_peer = Some(peer);
-
-        let (outbound_tx, outbound_rx) = mpsc::channel(1024);
-        let (inbound_tx, inbound_rx) = mpsc::channel(1024);
-        let tunnel = tokio::select! {
-            value = wireguard::WgTunnel::new(
-                wireguard::WgConfig {
-                    local_private_key: private_key,
-                    peer_public_key: public_key,
-                    peer_endpoint: peer,
-                    local_ipv4,
-                    local_ipv6,
-                    client_id: identity.client_id,
-                    preshared_key: None,
-                    persistent_keepalive: Some(5),
-                    aethernoize: Arc::new(profile.clone()),
-                },
-                inbound_tx,
-            ) => value,
-            _ = &mut *stop => return Ok(()),
-        };
-        let tunnel = match tunnel {
-            Ok(tunnel) => tunnel,
-            Err(error) => {
-                log::warn!("WireGuard tunnel setup failed: {error}; reconnecting");
-                if reconnect_pause(stop).await {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-        log::info!("WireGuard data plane is ready; working noize profile: {profile_name}");
-
-        match bridge_and_run(
-            tun.clone(),
-            local_ipv4,
-            outbound_tx,
-            inbound_rx,
-            tunnel.run(outbound_rx),
-            stop,
-        )
-        .await?
-        {
-            BridgeOutcome::Stopped => return Ok(()),
-            BridgeOutcome::TunnelEnded => {
-                log::warn!("WireGuard tunnel ended; reconnecting");
-                if reconnect_pause(stop).await {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-async fn verify_wireguard_exit(
-    peer: SocketAddr,
-    private_key: [u8; 32],
-    public_key: [u8; 32],
-    client_id: [u8; 3],
-    local_ipv4: Ipv4Addr,
-    local_ipv6: Ipv6Addr,
-    profile: &aethernoize::AetherNoizeConfig,
-) -> Result<tunnelping::ExitRoute> {
-    let (_, session) = wireguard::verify_endpoint_keep_session(
-        peer,
-        private_key,
-        public_key,
-        client_id,
-        local_ipv4,
-        profile,
-        std::time::Duration::from_secs(8),
-        None,
-    )
-    .await?;
-    tunnelping::wg_exit_probe_established(
-        session,
-        &tunnelping::WgPingParams {
-            local_ipv4,
-            local_ipv6,
-            aethernoize: profile.clone(),
-        },
-        std::time::Duration::from_secs(12),
-    )
-    .await
-}
-
-fn log_verified_exit(route: &tunnelping::ExitRoute) {
+    // An organization token from an earlier VPN session must not sign in another team.
+    aether::zerotrust::clear_token().await;
+    let proxy = configure(&cfg)?;
+    let level = cfg
+        .options
+        .get("AETHER_LOG_LEVEL")
+        .and_then(|value| value.parse::<log::LevelFilter>().ok())
+        .unwrap_or(log::LevelFilter::Info);
+    // Android lifecycle/statistics events must remain available at every verbosity.
+    log::set_max_level(level.max(log::LevelFilter::Info));
+    aether::socks::reset_session_settings();
     log::info!(
-        "exit route verified: ip={}, country={}, colo={}, latency={}ms",
-        route.ip,
-        route.country_code,
-        route.colo,
-        route.latency.as_millis(),
+        "native build uses vendored Koku engine snapshot {}",
+        env!("KOKU_ENGINE_SOURCE")
     );
-}
-
-async fn run_masque(
-    cfg: AndroidConfig,
-    tun: Arc<AsyncFd<File>>,
-    stop: &mut oneshot::Receiver<()>,
-) -> Result<()> {
-    let path = format!("{}/aether-masque.toml", cfg.config_dir);
-    let identity = tokio::select! {
-        value = load_or_create_identity(&path, true) => value?,
-        _ = &mut *stop => return Ok(()),
-    };
-    let local_ipv4: Ipv4Addr = identity
-        .ipv4
-        .split('/')
-        .next()
-        .unwrap_or(&identity.ipv4)
-        .parse()
-        .map_err(|_| AetherError::Other("invalid identity IPv4".into()))?;
-    log::info!("WARP identity ready with tunnel IPv4 {local_ipv4}");
-    let mut profile_name = if cfg.noize_profile == "balanced" {
-        "firewall".to_string()
-    } else {
-        cfg.noize_profile.clone()
-    };
-    let mut noise = noize::from_profile(&profile_name);
-    let h2_enabled = is_h2_protocol(&cfg.protocol);
-    let scan_mode = prober::ScanMode::parse(&cfg.scan_mode);
-    let mut last_good_peer: Option<SocketAddr> = None;
-    let mut rejected_exit_peers = HashSet::new();
-
-    loop {
-        let mut selected_peer = None;
-        if let Some(peer) = last_good_peer {
-            log::info!("retrying last known-good MASQUE gateway {peer}");
-            let retry = tokio::select! {
-                value = verify_masque_peer(
-                    &identity,
-                    peer,
-                    local_ipv4,
-                    noise.clone(),
-                    h2_enabled,
-                ) => Some(value),
-                _ = &mut *stop => None,
-            };
-            let Some(retry) = retry else {
-                return Ok(());
-            };
-            match retry {
-                Ok(_) => {
-                    log::info!("last known-good MASQUE gateway is still healthy");
-                    selected_peer = Some(peer);
-                }
-                Err(error) => {
-                    log::warn!(
-                        "last known-good MASQUE gateway failed verification: {error}; rescanning"
-                    );
-                }
-            }
-        }
-
-        let peer = match selected_peer {
-            Some(peer) => peer,
-            None => {
-                log::info!("scanning for a working MASQUE endpoint");
-                let mut selected = None;
-                let mut last_error = None;
-                for candidate_name in profile_candidates(&profile_name, false) {
-                    let candidate_noise = noize::from_profile(&candidate_name);
-                    let probe = prober::MasqueProbe {
-                        sni: consts::CONNECT_SNI.to_string(),
-                        authority: quic::default_authority().to_string(),
-                        path: quic::default_path().to_string(),
-                        cert_pem: Arc::from(identity.cert_pem.clone()),
-                        key_pem: Arc::from(identity.key_pem.clone()),
-                        ech_config_list: None,
-                        noize: candidate_noise.clone(),
-                        ports: prober::MASQUE_PORTS.to_vec(),
-                        ip: prober::IpScan::parse(&cfg.ip_mode),
-                        local_ipv4,
-                    };
-                    log::info!("testing MASQUE noize profile '{candidate_name}'");
-                    let found = tokio::select! {
-                        value = prober::hunt_best_gateway_excluding(
-                            &probe,
-                            scan_mode,
-                            &rejected_exit_peers,
-                        ) => value,
-                        _ = &mut *stop => return Ok(()),
-                    };
-                    match found {
-                        Ok(found) => {
-                            profile_name = candidate_name;
-                            noise = candidate_noise;
-                            selected = Some(SocketAddr::new(found.ip, found.port));
-                            break;
-                        }
-                        Err(error) => {
-                            log::warn!("MASQUE profile '{candidate_name}' failed: {error}");
-                            last_error = Some(error.to_string());
-                        }
-                    }
-                }
-                selected.ok_or_else(|| {
-                    AetherError::Other(format!(
-                        "all MASQUE profiles failed: {}",
-                        last_error.unwrap_or_else(|| "no endpoint".to_string())
-                    ))
-                })?
-            }
-        };
-        log::info!("using MASQUE endpoint {peer}");
-
-        if cfg.no_ir_exit {
-            let route = tokio::select! {
-                value = verify_masque_exit(
-                    &identity,
-                    peer,
-                    local_ipv4,
-                    noise.clone(),
-                ) => value,
-                _ = &mut *stop => return Ok(()),
-            };
-            match route {
-                Ok(route) if !route.country_code.eq_ignore_ascii_case("IR") => {
-                    log_verified_exit(&route);
-                }
-                Ok(route) => {
-                    log::warn!(
-                        "NO-IR exit rejected endpoint {peer}: ip={}, country={}, colo={}",
-                        route.ip,
-                        route.country_code,
-                        route.colo,
-                    );
-                    rejected_exit_peers.insert(peer);
-                    last_good_peer = None;
-                    if rejected_exit_peers.len() >= MAX_NO_IR_ROUTE_ATTEMPTS {
-                        return Err(AetherError::Other(format!(
-                            "NO-IR Exit could not find a non-Iran route after {} attempts",
-                            rejected_exit_peers.len()
-                        )));
-                    }
-                    continue;
-                }
-                Err(error) => {
-                    log::warn!("NO-IR exit verification failed for {peer}: {error}");
-                    rejected_exit_peers.insert(peer);
-                    last_good_peer = None;
-                    if rejected_exit_peers.len() >= MAX_NO_IR_ROUTE_ATTEMPTS {
-                        return Err(AetherError::Other(format!(
-                            "NO-IR Exit could not verify a safe route after {} attempts: {error}",
-                            rejected_exit_peers.len()
-                        )));
-                    }
-                    continue;
-                }
-            }
-        }
-        last_good_peer = Some(peer);
-
-        let (channels, internals) = quic::channels();
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let tunnel = if h2_enabled {
-            let h2 = masque_h2::H2TunnelConfig {
-                peer: masque_h2::h2_peer(peer),
-                sni: consts::CONNECT_SNI.to_string(),
-                authority: quic::default_authority().to_string(),
-                path: quic::default_path().to_string(),
-                cert_pem: identity.cert_pem.clone(),
-                key_pem: identity.key_pem.clone(),
-                local_ipv4,
-                quiet: false,
-                pin_endpoint: true,
-                expected_pins: consts::MASQUE_PINS.iter().map(|pin| pin.to_vec()).collect(),
-            };
-            tokio::spawn(masque_h2::run(h2, internals, None, Some(ready_tx)))
-        } else {
-            let h3 = quic::TunnelConfig {
-                peer,
-                sni: consts::CONNECT_SNI.to_string(),
-                authority: quic::default_authority().to_string(),
-                path: quic::default_path().to_string(),
-                cert_pem: identity.cert_pem.clone(),
-                key_pem: identity.key_pem.clone(),
-                ech_config_list: None,
-                noize: noise.clone(),
-                local_ipv4,
-                quiet: false,
-            };
-            tokio::spawn(quic::run(h3, internals, None, Some(ready_tx)))
-        };
-
-        let ready = tokio::select! {
-            ready = ready_rx => ready,
-            _ = &mut *stop => {
-                tunnel.abort();
-                return Ok(());
-            }
-        };
-        if ready.is_err() {
-            log::warn!("MASQUE validation failed; reconnecting");
-            tunnel.abort();
-            if reconnect_pause(stop).await {
-                return Ok(());
-            }
-            continue;
-        }
-        log::info!("MASQUE data plane is ready; working noize profile: {profile_name}");
-
-        match bridge_and_run(
-            tun.clone(),
-            local_ipv4,
-            channels.outbound_tx,
-            channels.inbound_rx,
-            async move {
-                tunnel
-                    .await
-                    .map_err(|err| AetherError::Other(format!("MASQUE task: {err}")))?
-            },
-            stop,
-        )
-        .await?
-        {
-            BridgeOutcome::Stopped => return Ok(()),
-            BridgeOutcome::TunnelEnded => {
-                log::warn!("MASQUE tunnel ended; reconnecting");
-                if reconnect_pause(stop).await {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-async fn verify_masque_exit(
-    identity: &account::Identity,
-    peer: SocketAddr,
-    local_ipv4: Ipv4Addr,
-    noise: noize::NoizeConfig,
-) -> Result<tunnelping::ExitRoute> {
-    tunnelping::masque_exit_probe(
-        &tunnelping::MasquePingParams {
-            peer,
-            sni: consts::CONNECT_SNI.to_string(),
-            authority: quic::default_authority().to_string(),
-            path: quic::default_path().to_string(),
-            cert_pem: identity.cert_pem.clone(),
-            key_pem: identity.key_pem.clone(),
-            noize: noise,
-            local_ipv4,
-            local_ipv4_str: identity.ipv4.clone(),
-            local_ipv6_str: identity.ipv6.clone(),
-        },
-        std::time::Duration::from_secs(12),
-    )
-    .await
-}
-
-async fn verify_masque_peer(
-    identity: &account::Identity,
-    peer: SocketAddr,
-    local_ipv4: Ipv4Addr,
-    noise: noize::NoizeConfig,
-    h2_enabled: bool,
-) -> Result<std::time::Duration> {
-    if h2_enabled {
-        let cfg = masque_h2::H2TunnelConfig {
-            peer: masque_h2::h2_peer(peer),
-            sni: consts::CONNECT_SNI.to_string(),
-            authority: quic::default_authority().to_string(),
-            path: quic::default_path().to_string(),
-            cert_pem: identity.cert_pem.clone(),
-            key_pem: identity.key_pem.clone(),
-            local_ipv4,
-            quiet: true,
-            pin_endpoint: true,
-            expected_pins: consts::MASQUE_PINS.iter().map(|pin| pin.to_vec()).collect(),
-        };
-        return masque_h2::verify_h2(&cfg, std::time::Duration::from_secs(6)).await;
-    }
-
-    quic::verify_masque(&quic::VerifyParams {
-        peer,
-        sni: consts::CONNECT_SNI.to_string(),
-        authority: quic::default_authority().to_string(),
-        path: quic::default_path().to_string(),
-        cert_pem: identity.cert_pem.clone(),
-        key_pem: identity.key_pem.clone(),
-        ech_config_list: None,
-        noize: noise,
-        timeout: std::time::Duration::from_secs(6),
-        local_ipv4,
-    })
-    .await
-}
-
-async fn reconnect_pause(stop: &mut oneshot::Receiver<()>) -> bool {
+    let mut tc = tun::Configuration::default();
+    tc.raw_fd(owned.into_raw_fd())
+        .close_fd_on_drop(true)
+        .mtu(1280);
+    let device = tun::create_as_async(&tc).map_err(|e| AetherError::Other(e.to_string()))?;
+    let core = aether::run_with(Vec::new());
+    tokio::pin!(core);
     tokio::select! {
-        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => false,
-        _ = &mut *stop => true,
+        result = &mut core => return result,
+        _ = &mut stop => return Ok(()),
+        _ = wait_proxy(&proxy) => {},
     }
-}
-
-enum BridgeOutcome {
-    Stopped,
-    TunnelEnded,
-}
-
-async fn bridge_and_run<F>(
-    tun: Arc<AsyncFd<File>>,
-    tunnel_ip: Ipv4Addr,
-    outbound: mpsc::Sender<Vec<u8>>,
-    inbound: mpsc::Receiver<Vec<u8>>,
-    tunnel: F,
-    stop: &mut oneshot::Receiver<()>,
-) -> Result<BridgeOutcome>
-where
-    F: std::future::Future<Output = Result<()>>,
-{
-    log::info!(
-        "starting Android TUN packet bridge: app {} <-> tunnel {}",
-        VPN_IPV4,
-        tunnel_ip,
-    );
-    let stats = Arc::new(TrafficStats::default());
-    let reader = tun_to_tunnel(tun.clone(), tunnel_ip, outbound, stats.clone());
-    let writer = tunnel_to_tun(tun, tunnel_ip, inbound, stats.clone());
-    let reporter = report_traffic(stats);
-    tokio::pin!(reader);
-    tokio::pin!(writer);
-    tokio::pin!(reporter);
-    tokio::pin!(tunnel);
-
-    tokio::select! {
-        result = &mut reader => match result {
-            Ok(()) => Err(AetherError::Other("Android TUN reader closed".into())),
-            Err(error) => Err(error),
-        },
-        result = &mut writer => match result {
-            Ok(()) => Err(AetherError::Other("Android TUN writer closed".into())),
-            Err(error) => Err(error),
-        },
-        result = &mut reporter => match result {
-            Ok(()) => Err(AetherError::Other("traffic reporter closed".into())),
-            Err(error) => Err(error),
-        },
-        result = &mut tunnel => {
-            if let Err(error) = result {
-                log::warn!("tunnel task ended with error: {error}");
-            }
-            Ok(BridgeOutcome::TunnelEnded)
-        },
-        _ = &mut *stop => {
-            log::info!("packet bridge received stop signal");
-            Ok(BridgeOutcome::Stopped)
-        },
-    }
-}
-
-async fn tun_to_tunnel(
-    tun: Arc<AsyncFd<File>>,
-    tunnel_ip: Ipv4Addr,
-    outbound: mpsc::Sender<Vec<u8>>,
-    stats: Arc<TrafficStats>,
-) -> Result<()> {
-    let mut buffer = vec![0u8; 65536];
-    let mut first_packet = true;
-    loop {
-        let mut ready = tun.readable().await?;
-        match ready.try_io(|inner| {
-            let size = unsafe {
-                libc::read(
-                    inner.get_ref().as_raw_fd(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                )
-            };
-            if size >= 0 {
-                Ok(size as usize)
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        }) {
-            Ok(Ok(0)) => return Ok(()),
-            Ok(Ok(size)) => {
-                let mut packet = buffer[..size].to_vec();
-                let translated = translate_ipv4(&mut packet, VPN_IPV4, tunnel_ip, true);
-                if first_packet {
-                    log::info!(
-                        "first TUN -> tunnel packet: {}; source_rewritten={translated}",
-                        packet_summary(&packet),
-                    );
-                    first_packet = false;
-                }
-                stats.outbound_packets.fetch_add(1, Ordering::Relaxed);
-                stats
-                    .outbound_bytes
-                    .fetch_add(size as u64, Ordering::Relaxed);
-                outbound
-                    .send(packet)
-                    .await
-                    .map_err(|_| AetherError::Other("tunnel outbound channel closed".into()))?;
-            }
-            Ok(Err(err)) => return Err(AetherError::Io(err)),
-            Err(_) => continue,
-        }
-    }
-}
-
-async fn tunnel_to_tun(
-    tun: Arc<AsyncFd<File>>,
-    tunnel_ip: Ipv4Addr,
-    mut inbound: mpsc::Receiver<Vec<u8>>,
-    stats: Arc<TrafficStats>,
-) -> Result<()> {
-    let mut first_packet = true;
-    while let Some(mut packet) = inbound.recv().await {
-        let translated = translate_ipv4(&mut packet, tunnel_ip, VPN_IPV4, false);
-        if first_packet {
-            log::info!(
-                "first tunnel -> TUN packet: {}; destination_rewritten={translated}",
-                packet_summary(&packet),
-            );
-            first_packet = false;
-        }
-        stats.inbound_packets.fetch_add(1, Ordering::Relaxed);
-        stats
-            .inbound_bytes
-            .fetch_add(packet.len() as u64, Ordering::Relaxed);
-        let mut offset = 0;
-        while offset < packet.len() {
-            let mut ready = tun.writable().await?;
-            match ready.try_io(|inner| {
-                let size = unsafe {
-                    libc::write(
-                        inner.get_ref().as_raw_fd(),
-                        packet[offset..].as_ptr().cast(),
-                        packet.len() - offset,
-                    )
-                };
-                if size >= 0 {
-                    Ok(size as usize)
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            }) {
-                Ok(Ok(0)) => return Err(AetherError::Other("zero-byte TUN write".into())),
-                Ok(Ok(size)) => offset += size,
-                Ok(Err(err)) => return Err(AetherError::Io(err)),
-                Err(_) => continue,
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn report_traffic(stats: Arc<TrafficStats>) -> Result<()> {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-    let mut previous = (0, 0, 0, 0);
-    let mut idle_ticks = 0u32;
-    interval.tick().await;
-    loop {
-        interval.tick().await;
-        let current = (
-            stats.outbound_packets.load(Ordering::Relaxed),
-            stats.outbound_bytes.load(Ordering::Relaxed),
-            stats.inbound_packets.load(Ordering::Relaxed),
-            stats.inbound_bytes.load(Ordering::Relaxed),
-        );
-        if current != previous {
-            log::info!(
-                "traffic: TUN -> tunnel {} packets / {} bytes; tunnel -> TUN {} packets / {} bytes",
-                current.0,
-                current.1,
-                current.2,
-                current.3,
-            );
-            previous = current;
-            idle_ticks = 0;
-        } else {
-            idle_ticks += 1;
-            if idle_ticks == 5 {
-                log::warn!("traffic idle: Android has not delivered any new IPv4 packets for 10s");
-            }
-        }
-    }
-}
-
-fn packet_summary(packet: &[u8]) -> String {
-    if packet.len() < 20 || packet[0] >> 4 != 4 {
-        return format!("non-IPv4, {} bytes", packet.len());
-    }
-    let source = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-    let destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    format!(
-        "{source} -> {destination}, proto={}, {} bytes",
-        packet[9],
-        packet.len()
-    )
-}
-
-fn translate_ipv4(packet: &mut [u8], old: Ipv4Addr, new: Ipv4Addr, source: bool) -> bool {
-    if packet.len() < 20 || packet[0] >> 4 != 4 {
-        return false;
-    }
-    let ihl = ((packet[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || packet.len() < ihl {
-        return false;
-    }
-    let address_offset = if source { 12 } else { 16 };
-    if packet[address_offset..address_offset + 4] != old.octets() {
-        return false;
-    }
-    packet[address_offset..address_offset + 4].copy_from_slice(&new.octets());
-
-    let fragment = u16::from_be_bytes([packet[6], packet[7]]);
-    if fragment & 0x1fff == 0 {
-        let checksum_offset = match packet[9] {
-            6 if packet.len() >= ihl + 18 => Some(ihl + 16),
-            17 if packet.len() >= ihl + 8 => Some(ihl + 6),
-            _ => None,
+    if cfg.no_ir_exit {
+        let exit = tokio::select! {
+            result = &mut core => return result,
+            _ = &mut stop => return Ok(()),
+            exit = aether::exitloc::report_through_socks(proxy.parse().unwrap(), "Android final proxy") => exit,
         };
-        if let Some(offset) = checksum_offset {
-            let checksum = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
-            if checksum != 0 {
-                let updated = update_checksum(checksum, old.octets(), new.octets());
-                packet[offset..offset + 2].copy_from_slice(&updated.to_be_bytes());
+        match exit {
+            Some(ref exit) if exit.country.as_deref().is_some_and(|c| c != "IR") => {}
+            _ => {
+                return Err(AetherError::Other(
+                    "NO-IR Exit: final exit is Iranian or unverifiable".into(),
+                ))
             }
         }
     }
-
-    packet[10] = 0;
-    packet[11] = 0;
-    let checksum = internet_checksum(&packet[..ihl]);
-    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
-    true
-}
-
-fn update_checksum(checksum: u16, old: [u8; 4], new: [u8; 4]) -> u16 {
-    let mut sum = (!checksum as u32)
-        + (!u16::from_be_bytes([old[0], old[1]]) as u32 & 0xffff)
-        + u16::from_be_bytes([new[0], new[1]]) as u32
-        + (!u16::from_be_bytes([old[2], old[3]]) as u32 & 0xffff)
-        + u16::from_be_bytes([new[2], new[3]]) as u32;
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
+    let stats = Arc::new(Traffic::default());
+    let counted = CountingDevice {
+        inner: device,
+        stats: stats.clone(),
+    };
+    let mut args = tun2proxy::Args::default();
+    args.proxy = tun2proxy::ProxyParameters::try_from(format!("socks5://{proxy}").as_str())
+        .map_err(|e| AetherError::Other(e.to_string()))?;
+    args.dns = tun2proxy::ArgDns::OverTcp;
+    args.setup = false;
+    args.ipv6_enabled = true;
+    args.tcp_mss = Some(1240);
+    let cancel = tun2proxy::CancellationToken::new();
+    let bridge = tun2proxy::run(counted, 1280, args, cancel.clone());
+    tokio::pin!(bridge);
+    log::info!("starting Android TUN packet bridge through {proxy}");
+    let guard = watch_final_proxy(proxy.clone(), cfg.no_ir_exit);
+    tokio::pin!(guard);
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            _ = &mut stop => { cancel.cancel(); let _ = tokio::time::timeout(std::time::Duration::from_secs(3), &mut bridge).await; return Ok(()); },
+            result = &mut core => return result,
+            reason = &mut guard => return Err(reason),
+            result = &mut bridge => return result.map(|_| ()).map_err(|e| AetherError::Other(e.to_string())),
+            _ = tick.tick() => log::info!("traffic: TUN -> tunnel {} packets / {} bytes; tunnel -> TUN {} packets / {} bytes; TCP payload: out {} / in {} bytes", stats.out_packets.load(Ordering::Relaxed), stats.out_bytes.load(Ordering::Relaxed), stats.in_packets.load(Ordering::Relaxed), stats.in_bytes.load(Ordering::Relaxed), stats.out_tcp_payload.load(Ordering::Relaxed), stats.in_tcp_payload.load(Ordering::Relaxed)),
+        }
     }
-    !(sum as u16)
 }
-
-fn internet_checksum(data: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in data.chunks(2) {
-        sum += if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
-        } else {
-            (chunk[0] as u32) << 8
-        };
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn checksum_translation_is_reversible() {
-        let mut packet = vec![
-            0x45, 0, 0, 40, 0, 0, 0x40, 0, 64, 6, 0, 0, 172, 31, 19, 2, 1, 1, 1, 1,
-        ];
-        packet.extend_from_slice(&[
-            0x12, 0x34, 0, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0x50, 2, 0xff, 0xff, 0x44, 0x55, 0, 0,
-        ]);
-        let header = internet_checksum(&packet[..20]);
-        packet[10..12].copy_from_slice(&header.to_be_bytes());
-        let original_tcp = u16::from_be_bytes([packet[36], packet[37]]);
-
-        let assigned = Ipv4Addr::new(100, 96, 0, 2);
-        translate_ipv4(&mut packet, VPN_IPV4, assigned, true);
-        translate_ipv4(&mut packet, assigned, VPN_IPV4, true);
-
-        assert_eq!(&packet[12..16], &VPN_IPV4.octets());
-        assert_eq!(u16::from_be_bytes([packet[36], packet[37]]), original_tcp);
-        assert_eq!(internet_checksum(&packet[..20]), 0);
+    fn managed_paths_and_listeners_cannot_be_overridden() {
+        for key in [
+            "AETHER_CONFIG",
+            "AETHER_SOCKS",
+            "AETHER_MARK",
+            "AETHER_REGISTER",
+        ] {
+            assert!(!OPTIONS.contains(&key));
+        }
+        for key in [
+            "AETHER_ROUTE_BLOCK",
+            "AETHER_UPSTREAM",
+            "AETHER_ECH",
+            "AETHER_TOR",
+        ] {
+            assert!(OPTIONS.contains(&key));
+        }
     }
+}
+#[no_mangle]
+pub extern "system" fn Java_io_github_lvl45t3r_koku_AetherNative_nativeTeam(
+    mut env: JNIEnv,
+    _class: JClass,
+    action: JString,
+    payload: JString,
+) -> jni::sys::jstring {
+    use std::ffi::CStr;
+    let reply = (|| -> std::result::Result<String, String> {
+        let action: String = env.get_string(&action).map_err(|e| e.to_string())?.into();
+        let raw: String = env.get_string(&payload).map_err(|e| e.to_string())?.into();
+        let body: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let id = body.get("id").and_then(|v| v.as_u64()).unwrap_or_default();
+        let cbody = CString::new(raw).map_err(|e| e.to_string())?;
+        let ptr = unsafe {
+            match action.as_str() {
+                "request" if !ACTIVE.load(Ordering::SeqCst) => {
+                    aether::ffi::aether_team_code_request(cbody.as_ptr())
+                }
+                "resend" if !ACTIVE.load(Ordering::SeqCst) => {
+                    aether::ffi::aether_team_code_resend(id)
+                }
+                "submit" if !ACTIVE.load(Ordering::SeqCst) => {
+                    let code = CString::new(
+                        body.get("code")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    aether::ffi::aether_team_code_submit(id, code.as_ptr())
+                }
+                "poll" => aether::ffi::aether_job_poll(id),
+                "free" => aether::ffi::aether_job_free(id),
+                "sessionFree" => aether::ffi::aether_team_session_free(id),
+                _ => return Err("Disconnect before signing in, or choose a valid action".into()),
+            }
+        };
+        if ptr.is_null() {
+            return Err("Core returned no reply".into());
+        }
+        let reply = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
+        unsafe {
+            aether::ffi::aether_string_free(ptr);
+        }
+        Ok(reply)
+    })()
+    .unwrap_or_else(|e| serde_json::json!({"ok": false, "error": e}).to_string());
+    env.new_string(reply)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+async fn watch_final_proxy(proxy: String, enabled: bool) -> AetherError {
+    if !enabled {
+        if aether::exitloc::report_through_socks(proxy.parse().unwrap(), "Android final proxy")
+            .await.is_none() {
+            log::warn!("Final proxy exit verification unavailable");
+        }
+        return std::future::pending().await;
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        match aether::exitloc::report_through_socks(proxy.parse().unwrap(), "Android final proxy")
+            .await
+        {
+            Some(exit) if exit.country.as_deref().is_some_and(|c| c != "IR") => {}
+            _ => {
+                return AetherError::Other(
+                    "NO-IR Exit: final exit changed or became unverifiable".into(),
+                )
+            }
+        }
+    }
+}
+#[no_mangle]
+pub extern "system" fn Java_io_github_lvl45t3r_koku_AetherNative_nativeIsRunning(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    u8::from(ACTIVE.load(Ordering::SeqCst))
 }

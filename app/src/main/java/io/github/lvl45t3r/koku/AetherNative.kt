@@ -16,6 +16,7 @@ object AetherNative {
         """traffic: TUN -> tunnel (\d+) packets / (\d+) bytes; tunnel -> TUN (\d+) packets / (\d+) bytes"""
     )
     private val workingProfilePattern = Regex("""working noize profile: ([a-z]+)""")
+    private val tcpPayloadPattern = Regex("""TCP payload: out (\d+) / in (\d+) bytes""")
     private val exitRoutePattern = Regex(
         """exit route verified: ip=([^,]+), country=([A-Za-z]{2}), colo=([^,]*), latency=(\d+)ms""",
     )
@@ -26,6 +27,10 @@ object AetherNative {
     private val mutableDiagnosticsEnabled = MutableStateFlow(false)
     private val logSink = NativeLogSink(::appendLog)
     private var testBaseline = TrafficSnapshot()
+    @Volatile private var workerFinishedReceiver: (() -> Unit)? = null
+    private var finalCarrier = false
+    private val coreExitPattern = Regex("""exit: ([^,]+), (?:([A-Za-z]{2})(?: via ([^,]+))?, )?(\d+)ms""")
+    private val coreProfilePattern = Regex("""selected WireGuard endpoint .* using aethernoize profile '([a-z]+)'""" )
     @Volatile private var workingProfileReceiver: ((String) -> Unit)? = null
 
     val logs: StateFlow<List<String>> = mutableLogs.asStateFlow()
@@ -56,6 +61,7 @@ object AetherNative {
     }
 
     fun markStopped() {
+        if (loaded && nativeIsRunning()) { mutableTunnelState.value = TunnelState.STOPPING; return }
         mutableTunnelState.value = TunnelState.IDLE
         mutableTestState.value = ConnectionTestState.IDLE
     }
@@ -105,6 +111,9 @@ object AetherNative {
         configDir: String,
         tun: ParcelFileDescriptor,
         onWorkingProfile: (String) -> Unit,
+        options: JSONObject = JSONObject(),
+        psiphonBin: String = "",
+        onWorkerFinished: () -> Unit = {},
     ): Long {
         check(loaded) { "Native Aether library is unavailable." }
         val configJson = JSONObject()
@@ -114,8 +123,12 @@ object AetherNative {
             .put("noizeProfile", noizeProfile)
             .put("noIrExit", noIrExit)
             .put("configDir", configDir)
+            .put("options", options)
+            .put("psiphonBin", psiphonBin)
             .toString()
         workingProfileReceiver = onWorkingProfile
+        workerFinishedReceiver = onWorkerFinished
+        finalCarrier = options.optString("AETHER_TOR", "off") != "off" || options.optString("AETHER_PSIPHON", "off") != "off"
         appendLog(
             "INFO",
             "Starting native engine: protocol=$protocol, scan=$scanMode, " +
@@ -165,10 +178,21 @@ object AetherNative {
 
         if ("starting Android TUN packet bridge" in message) {
             mutableTunnelState.value = TunnelState.CONNECTED
-        } else if (level.equals("ERROR", ignoreCase = true) && tunnelIsActive()) {
+        } else if (("reconnecting" in message || "rescanning" in message) && tunnelIsActive()) {
+            mutableTunnelState.value = TunnelState.STARTING
+        } else if (level.equals("ERROR", ignoreCase = true) && ("Aether engine stopped" in message || "NO-IR Exit:" in message) && tunnelIsActive()) {
             mutableTunnelState.value = TunnelState.FAILED
         }
 
+        if ("native worker finished" in message) {
+            if (mutableTunnelState.value == TunnelState.STOPPING) markStopped()
+            workerFinishedReceiver?.invoke(); workerFinishedReceiver = null
+        }
+        val isFinalExit = !finalCarrier || message.contains("tor", true) || message.contains("psiphon", true) || message.contains("Android final proxy")
+        if (isFinalExit) coreExitPattern.find(message)?.groupValues?.let { values ->
+            ConnectionProbe.acceptNativeExit(values[1], values[2].ifBlank { "ZZ" }, values[4].toLongOrNull() ?: 0L)
+        }
+        coreProfilePattern.find(message)?.groupValues?.getOrNull(1)?.let { workingProfileReceiver?.invoke(it) }
         workingProfilePattern.find(message)?.groupValues?.getOrNull(1)?.let { profile ->
             workingProfileReceiver?.invoke(profile)
         }
@@ -183,25 +207,35 @@ object AetherNative {
         if (level.equals("ERROR", ignoreCase = true) && "NO-IR Exit" in message) {
             ConnectionProbe.failNativeVerification(message.substringAfter(": ", message))
         }
+        if ("Final proxy exit verification unavailable" in message) {
+            ConnectionProbe.failNativeVerification("Final proxy exit verification unavailable")
+        }
 
         trafficPattern.find(message)?.destructured?.let {
             (outPackets, outBytes, inPackets, inBytes) ->
+            val payload = tcpPayloadPattern.find(message)?.groupValues
             val snapshot = TrafficSnapshot(
                 outboundPackets = outPackets.toLong(),
                 outboundBytes = outBytes.toLong(),
                 inboundPackets = inPackets.toLong(),
                 inboundBytes = inBytes.toLong(),
+                outboundTcpPayload = payload?.get(1)?.toLongOrNull() ?: 0L,
+                inboundTcpPayload = payload?.get(2)?.toLongOrNull() ?: 0L,
             )
+            val previous = mutableTraffic.value
             mutableTraffic.value = snapshot
+            if (mutableTunnelState.value == TunnelState.STARTING && snapshot.inboundTcpPayload > previous.inboundTcpPayload) {
+                mutableTunnelState.value = TunnelState.CONNECTED
+            }
             if (
                 mutableTestState.value == ConnectionTestState.RUNNING &&
-                snapshot.outboundPackets > testBaseline.outboundPackets &&
-                snapshot.inboundPackets > testBaseline.inboundPackets
+                snapshot.outboundTcpPayload > testBaseline.outboundTcpPayload &&
+                snapshot.inboundTcpPayload > testBaseline.inboundTcpPayload
             ) {
                 mutableTestState.value = ConnectionTestState.PASSED
                 if (mutableDiagnosticsEnabled.value) {
                     val successLine =
-                        "$time INFO  Google test passed: bidirectional tunnel traffic confirmed"
+                        "$time INFO  Google test passed: bidirectional TCP payload confirmed"
                     mutableLogs.value = (mutableLogs.value + successLine)
                         .takeLast(MAX_LOG_LINES)
                 }
@@ -220,6 +254,12 @@ object AetherNative {
         return state != TunnelState.IDLE && state != TunnelState.STOPPING
     }
 
+    fun teamCall(action: String, payload: JSONObject): JSONObject {
+        check(loaded) { "Native engine unavailable" }
+        return JSONObject(nativeTeam(action, payload.toString()))
+    }
+    private external fun nativeIsRunning(): Boolean
+    private external fun nativeTeam(action: String, payload: String): String
     @JvmStatic
     private external fun nativeStart(
         configJson: String,
@@ -247,6 +287,8 @@ enum class ConnectionTestState {
 }
 
 data class TrafficSnapshot(
+    val outboundTcpPayload: Long = 0,
+    val inboundTcpPayload: Long = 0,
     val outboundPackets: Long = 0,
     val outboundBytes: Long = 0,
     val inboundPackets: Long = 0,

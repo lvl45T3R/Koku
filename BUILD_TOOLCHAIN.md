@@ -154,3 +154,41 @@ $kokuVersion='X.Y.Z'; gh release create "v$kokuVersion" "releases\Koku-v$kokuVer
 | APK ساخته شده ولی ABI اشتباه دارد | خروجی `app-release.apk` بین variantها overwrite می‌شود | بعد از هر variant فوراً کپی و سپس `tar -tf`/ABI contents را بررسی کنید. |
 | release موجود با source جدید یکی نیست | assetهای tag قدیمی rebuild یا جایگزین شده‌اند | نسخه را یک پله بالا ببرید؛ tag موجود را بازنویسی نکنید و digest آنلاین را تطبیق دهید. |
 | بیلد موفق است ولی رفتار واقعی VPN ثابت نشده | دستگاه یا emulator به ADB وصل نیست | این محدودیت را در release note بنویسید و اولین تست device را جداگانه ثبت کنید. |
+# Aether 2.3.0 build additions
+
+For Koku 0.4.0 use Rust 1.98.0 inside .tooling/cargo and .tooling/rustup,
+Go 1.26.8 inside .tooling/go-1.26.8/go, and the existing NDK r26b.
+The native script sets CARGO_HOME and RUSTUP_HOME explicitly.
+
+Bootstrap the four Android Rust targets once. Retain the Go build cache under
+.tooling/go-cache and module cache under .tooling/go-path.
+
+Pinned downloads/sources:
+- https://go.dev/dl/go1.26.8.windows-amd64.zip
+- Psiphon: https://github.com/CluvexStudio/psiphon-tunnel-core at 83aa73b9b982e7421e00117f5b0c5aceb5dda452 in .tooling/psiphon-source
+- Lyrebird: https://proxy.golang.org/gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/@v/v0.0.0-20260312101154-fc105a03c0e0.zip under .tooling/lyrebird-source, retaining its module-path directory layout.
+
+Run scripts/build-helpers.ps1 before scripts/build-release.ps1. Both accept -Abis.
+Helpers use GOOS=android, CGO_ENABLED=1, API 24, PIE, 16-KiB segment alignment and
+-checklinkname=0 for the Android anet dependency. Their source archives accompany
+the release. A 403 from the Go proxy for klauspost/compress v1.17.11 can be resolved
+once with GOPROXY=direct; Go still verifies go.sum.
+
+Contract tests:
+.tooling/cargo/bin/cargo.exe test --locked --manifest-path tests/core-contract/Cargo.toml
+
+Do not package any older native libraries in a 0.4.0 APK. Verify signatures,
+versionCode 13, ABI contents, alignment and hashes for each asset before publishing.
+
+The release script sets CXXSTDLIB=c++_static so no separate libc++_shared.so is
+required. Aether's embedded dependency emits only an rlib; the Android JNI
+crate provides the shared-library entry points and 16KB ELF segment alignment.
+
+BoringSSL 5.2 additionally requires BORING_BSSL_RUST_CPPLIB=c++_static;
+CXXSTDLIB alone does not override its explicit Android runtime choice.
+The JNI build links the NDK static c++abi archive as well. Verify DT_NEEDED
+has only Android system libraries after every native rebuild.
+
+The matrix uses Cargo --jobs 1 on this Windows host. Compiling several full Aether
+cores simultaneously exhausted memory; all four targets are still produced from
+one source/lockfile. Start the emulator after native compilation on low-RAM hosts.

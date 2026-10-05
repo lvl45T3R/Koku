@@ -2,6 +2,30 @@
 
 All notable user-facing changes are recorded here. Per-release APK hashes and verification evidence live under `releases/`.
 
+## [0.4.0] - 2026-10-05
+
+### Added
+
+- Full Aether 2.3.0 core, quiche 0.29.3 and Tor/Arti upgrade.
+- Gool over MASQUE H2/H3, classic nested WireGuard, and nested MASQUE H2/H3.
+- Android Psiphon and Lyrebird helpers; inside/outside/standalone carrier controls, CDN/fronting and bridges.
+- Domain/IP/port block/direct routing, TLS/HTTP name sniffing, upstream proxy, ECH/TLS/API fields and configuration import.
+- Zero Trust service-token/JWT and in-app email-code sign-in.
+- Five scan modes, persistent protocol/scan selection, IPv4/IPv6 TUN frontend and tunneled DNS over TCP.
+
+### Improved
+
+- Upstream automatic reconnect and last-good gateway validation; actual TUN counters retained.
+- NO-IR pre-bridge and periodic verification of the final proxy.
+- Exclusive runtime shutdown and service cleanup on terminal failure.
+- Exit display probes the actual final SOCKS proxy; per-app exclusions cannot replace it with the direct DownloadManager route.
+- Connection tests require bidirectional TCP payload; locally generated ACK/RST and DNS packets do not produce a pass.
+- Updater selects a compatible architecture or universal package.
+- Route/Gateway, token and resource-profile settings reset correctly between sessions.
+- Rust 1.98.0 / Go 1.26.8 scripts, Android PIE helpers and 16-KiB segment alignment.
+
+Existing DNS Storming, app include/bypass, diagnostics, updater and exit display remain available.
+Verification scope is in FEATURE_PARITY.md and the release notes.
 ## [0.3.8] - 2026-08-17
 
 ### Added

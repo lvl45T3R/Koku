@@ -24,8 +24,8 @@ android {
         applicationId = "io.github.lvl45t3r.koku"
         minSdk = 24
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.3.9"
+        versionCode = 13
+        versionName = "0.4.0"
 
         ndk {
             abiFilters += requestedAbis
@@ -53,6 +53,12 @@ android {
             signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
         }
+    }
+
+    packaging {
+        jniLibs.useLegacyPackaging = true
+        jniLibs.keepDebugSymbols += "**/libpsiphon.so"
+        jniLibs.keepDebugSymbols += "**/liblyrebird.so"
     }
 
     buildFeatures {

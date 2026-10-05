@@ -1,81 +1,43 @@
-# Source provenance
+﻿# Source provenance
 
-## Repository relationship
+Koku: https://github.com/lvl45T3R/Koku
 
-Koku is a standalone Android repository. Its Android interface, `VpnService`
-integration, JNI boundary, and TUN adapter are maintained here. The native
-transport layer reuses selected Aether modules and Cloudflare quiche source,
-both vendored under `engine/`.
+| Component | Source | Pinned revision/version | License |
+|---|---|---|---|
+| Aether full core | https://github.com/CluvexStudio/Aether | 6175b67df370ab856bcee07fe85b524031903956 / 2.3.0 | AGPL-3.0 |
+| quiche | Aether's quiche vendor tree at that commit | 0.29.3 | BSD-2-Clause |
+| tun2proxy | https://github.com/tun2proxy/tun2proxy | 62109025df9b331ae9e5fca8e49f812eb6ce0747 / 0.8.4 | MIT |
+| Psiphon helper | https://github.com/CluvexStudio/psiphon-tunnel-core/tree/83aa73b9b982e7421e00117f5b0c5aceb5dda452 | 83aa73b9b982e7421e00117f5b0c5aceb5dda452 | GPL-3.0 |
+| Lyrebird helper | https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird | v0.0.0-20260312101154-fc105a03c0e0 | BSD-3-Clause / GPL-3.0 components |
+| Arti/Tor | crates.io dependencies of Aether's tor feature | 0.46.0; native/Cargo.lock | MIT/Apache-2.0 and dependency licenses |
+| DNS Hunter method/data | https://github.com/mirarr-app/network-checker | third_party/network-checker/UPSTREAM.md | GPL-3.0 |
 
-| Role | Repository |
-| --- | --- |
-| Koku Android repository | `https://github.com/lvl45T3R/Koku.git` |
-| Aether upstream project | `https://github.com/CluvexStudio/Aether.git` |
-| quiche upstream project | `https://github.com/cloudflare/quiche.git` |
+The Aether source and quiche trees are fully vendored. The old selective 1.5
+Android port is replaced by the full upstream library. The Android-specific
+adapter now lives in native/src/lib.rs and native/src/settings.rs, with tun2proxy
+as its TUN frontend. Existing identities remain under the previous private base
+paths; the upstream core manages certificates, organization profiles, and
+secondary identities.
 
-The vendored snapshot is intentionally stored without upstream Git metadata.
-`engine/REVISION` records the upstream Aether release and commit used by the
-Android build. The current transport port is based on Aether `v1.5.0` at
-`66a798b`. It selectively carries the transport, probe, and resolver fixes
-used by the Android adapter; the upstream CLI-only API front, routing-rule
-menu, and Zero Trust enrolment flow are intentionally not exposed here.
-The upstream quiche 0.29.3 vendor refresh is also deferred until the Android
-Rust/NDK toolchain can compile and exercise that much larger dependency bump.
+The tun2proxy build script has one Android cross-build adjustment: its Windows
+wintun copying code runs only for a Windows target, rather than any Windows host.
+No transport logic is modified. Its license remains in third_party/tun2proxy.
 
-## Reused source
+Go helper sources use the exact commits pinned by Aether's build scripts. They
+are compiled for Android, with PIE, NDK API 24, 16-KiB segment alignment and
+`-checklinkname=0` for Psiphon's Android anet compatibility. Source archives and
+revision/checksum evidence accompany the release; unmodified licenses are in
+third_party/helpers. Rebuild commands are in scripts/build-helpers.ps1.
 
-`native/src/lib.rs` includes the required Aether modules from
-`engine/aether/src`. This covers endpoint discovery, account provisioning,
-MASQUE, HTTP/2, WireGuard, TLS, fragmentation, and obfuscation behavior.
-It also includes Aether's Ironclad tunnel probe, MASQUE SPKI certificate
-pinning, reconnect task cleanup, WireGuard dead-tunnel detection, adaptive
-runtime tuning, netstack backpressure fixes, authenticated DNS replies,
-source-locked SOCKS UDP associations, and the corrected v1.5 endpoint scan
-order.
+Rust dependencies are locked by native/Cargo.lock; Go modules are locked by the
+helpers' go.mod/go.sum (Psiphon also retains its upstream vendor directory).
+No credential, private WARP identity, signing key or downloaded tool is published.
 
-`native/Cargo.toml` resolves the local transport dependencies from the same
-repository:
+The embedding adds two small Aether patches: SOCKS route/gateway settings can be
+reset between VPN sessions, and resource profiles have separate caches so changing
+low/medium/high takes effect on the next connection. The native adapter also
+clears the previous session's Zero Trust token cache before installing new options.
 
-```toml
-quiche = { path = "../engine/quiche/quiche" }
-octets = { path = "../engine/quiche/octets" }
-```
-
-The native build script watches these vendored directories and embeds the
-source identifier from `engine/REVISION` in `libaether_android.so`.
-
-## Android-specific code
-
-The following code is specific to this client and is not taken from the Aether
-command-line interface:
-
-- Kotlin Compose interface and connection state
-- Android `VpnService` lifecycle and foreground notification
-- JNI lifecycle and log callback
-- Android TUN descriptor handling
-- IPv4 address and transport-checksum translation
-- Traffic counters and external-browser connection test
-- Three-section Compose interface and launcher artwork integration
-- Post-connect public exit-address and country check
-- Android TUN-preserving transport reconnect supervisor
-- Fast and Reliable scan-mode selection
-
-The Aether command-line interface remains SOCKS5-based. The Android adapter
-replaces that boundary with direct packet I/O while reusing the transport
-implementations.
-
-## Third-party source
-
-Aether is developed by CluvexStudio and distributed under AGPL-3.0. The
-vendored quiche source is developed by Cloudflare and retains its BSD-2-Clause
-license and copyright notices.
-
-Only the quiche workspace members required for the Android native library are
-vendored: `quiche`, `octets`, and `qlog`. Unrelated examples, test
-certificates, applications, fuzzing corpora, and tools are not included.
-
-Public exit-address metadata is requested from the free `ipwho.is` HTTPS API.
-The Android system download service performs that request so it follows the VPN
-route while the Koku package itself remains excluded to prevent a socket loop.
-The displayed latency is the end-to-end HTTPS probe duration, not raw ICMP
-round-trip time.
+For Android, the Aether dependency emits only its Rust library; the JNI crate
+is the sole packaged core shared library. The upstream FFI code is retained.
+The build statically links the C++ runtime using CXXSTDLIB=c++_static.

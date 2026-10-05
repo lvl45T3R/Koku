@@ -14,6 +14,7 @@ import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import io.github.lvl45t3r.koku.AetherNative
 import io.github.lvl45t3r.koku.ConnectionProbe
+import io.github.lvl45t3r.koku.EngineSettings
 import io.github.lvl45t3r.koku.DnsHunter
 import io.github.lvl45t3r.koku.MainActivity
 import io.github.lvl45t3r.koku.PerAppProxyMode
@@ -42,7 +43,7 @@ class AetherVpnService : VpnService() {
 
     override fun onDestroy() {
         startupGeneration++
-        stopTunnel()
+        stopTunnel(preserveFailure = AetherNative.tunnelState.value == TunnelState.FAILED)
         super.onDestroy()
     }
 
@@ -147,6 +148,8 @@ class AetherVpnService : VpnService() {
             .setSession("Koku")
             .setMtu(1280)
             .addAddress("172.31.19.2", 32)
+            .addAddress("fd00:ae::2", 128)
+            .addRoute("::", 0)
             .addDnsServer(dnsServer)
             .addRoute("0.0.0.0", 0)
             .also { builder ->
@@ -178,9 +181,19 @@ class AetherVpnService : VpnService() {
             noIrExit,
             filesDir.absolutePath,
             descriptor,
-        ) { workingProfile ->
-            NetworkProfileCache.save(this, networkKey, protocol, workingProfile)
-        }
+            onWorkingProfile = { workingProfile ->
+                NetworkProfileCache.save(this, networkKey, protocol, workingProfile)
+            },
+            options = EngineSettings.load(this),
+            psiphonBin = java.io.File(applicationInfo.nativeLibraryDir, "libpsiphon.so").absolutePath,
+            onWorkerFinished = {
+                Handler(Looper.getMainLooper()).post {
+                    val failed = AetherNative.tunnelState.value == TunnelState.FAILED
+                    stopTunnel(preserveFailure = failed)
+                    stopSelf()
+                }
+            },
+        )
         if (nativeHandle == 0L) {
             AetherNative.log("ERROR", "Native engine rejected startup")
             stopTunnel()
@@ -255,13 +268,13 @@ class AetherVpnService : VpnService() {
         }
     }
 
-    private fun stopTunnel() {
+    private fun stopTunnel(preserveFailure: Boolean = false) {
         AetherNative.stop(nativeHandle)
         nativeHandle = 0
         runCatching { tun?.close() }
         tun = null
         stopForeground(STOP_FOREGROUND_REMOVE)
-        AetherNative.markStopped()
+        if (!preserveFailure) AetherNative.markStopped()
     }
 
     private fun notification(): Notification {

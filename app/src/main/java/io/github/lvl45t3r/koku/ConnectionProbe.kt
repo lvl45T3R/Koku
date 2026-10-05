@@ -44,6 +44,12 @@ object ConnectionProbe {
 
     val state: StateFlow<ProbeState> = mutableState.asStateFlow()
 
+    fun awaitNativeVerification() {
+        activeJob?.cancel()
+        activeJob = null
+        if (mutableState.value !is ProbeState.Ready) mutableState.value = ProbeState.Loading
+    }
+
     fun beginNativeVerification() {
         activeJob?.cancel()
         activeJob = null

@@ -22,3 +22,10 @@ app/src/main/jniLibs/
 
 !native/Cargo.toml
 !engine/**/*.toml
+.upstream-current/
+.tun2proxy-inspect/
+.publish-v040/
+.release-koku-*/
+.network-checker-inspect/
+!tests/**/*.toml
+!third_party/tun2proxy/**/*.toml

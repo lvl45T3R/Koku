@@ -1,0 +1,5 @@
+8f5af86e80f5751d4f13f6f762e8c67a21eb7a323ca9cc02e42ca9ca599d87f9  Koku-v0.4.0-arm64-v8a.apk
+c0f2b1aeeacfdfaf96f549b8af506bab6a7e7a48a957133e70204779cfe867f6  Koku-v0.4.0-armeabi-v7a.apk
+e460a90a67c8831d5e8f70b652b39cba0bc05190412c7034bbb8c90fb1b9baff  Koku-v0.4.0-lyrebird-source.zip
+8130650f0b763d53240b37dcabed75dad0beed76ef71909c5334595a758a2069  Koku-v0.4.0-psiphon-source.zip
+b79a5ffe69cdeb8df60a483b4dbdbf92f154ddb832821cf4dded5149fb88b2f3  Koku-v0.4.0-universal.apk
